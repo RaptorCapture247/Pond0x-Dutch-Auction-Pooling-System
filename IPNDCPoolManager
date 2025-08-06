@@ -1,0 +1,20 @@
+/**
+ * @title IPNDCPoolManager
+ * @dev Interface for the main pool management contract
+ */
+interface IPNDCPoolManager {
+    function getPoolInfo(uint256 poolId) external view returns (
+        address labelToken,
+        uint256 goal,
+        uint256 currentAmount,
+        uint256 deadline,
+        bool isActive,
+        bool goalMet,
+        bool hasWon,
+        address multisigWallet
+    );
+    
+    function isPoolEligibleForBid(uint256 poolId) external view returns (bool);
+    function markPoolAsWinner(uint256 poolId) external;
+    function distributeRewards(uint256 poolId, address rewardToken, uint256 amount) external;
+}
