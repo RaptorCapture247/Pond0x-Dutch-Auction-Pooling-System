@@ -1,0 +1,22 @@
+// Export for testing or modular usage
+module.exports = {
+    BotManager,
+    ConfigManager,
+    NotificationManager,
+    Pond0xAuctionBot,
+    PoolMonitorBot,
+    BiddingBot,
+    RewardDistributionBot,
+    BridgeBot,
+    HealthMonitorBot,
+    AnalyticsBot,
+    SecurityMonitorBot
+};
+
+// Run main function if this file is executed directly
+if (require.main === module) {
+    main().catch(error => {
+        logger.error(`Fatal error: ${error.message}`);
+        process.exit(1);
+    });
+}
