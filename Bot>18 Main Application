@@ -1,0 +1,66 @@
+// Main Application
+async function main() {
+    try {
+        logger.info('Starting PNDC Bot System...');
+        
+        // Initialize components
+        const configManager = new ConfigManager();
+        await configManager.loadFromEnvironment();
+        await configManager.loadFromFile('config.json');
+        
+        const notificationManager = new NotificationManager();
+        notificationManager.addChannel('webhook', notificationManager.webhookHandler);
+        notificationManager.addChannel('email', notificationManager.emailHandler);
+        notificationManager.addChannel('discord', notificationManager.discordHandler);
+        
+        const botManager = new BotManager();
+        await botManager.initialize();
+        
+        // Start all bots
+        await botManager.startAll();
+        
+        // Graceful shutdown handling
+        process.on('SIGINT', async () => {
+            logger.info('Received SIGINT, shutting down gracefully...');
+            await botManager.stopAll();
+            process.exit(0);
+        });
+        
+        process.on('SIGTERM', async () => {
+            logger.info('Received SIGTERM, shutting down gracefully...');
+            await botManager.stopAll();
+            process.exit(0);
+        });
+        
+        // Keep the process running
+        logger.info('PNDC Bot System started successfully');
+        
+        // Health check endpoint (if running as web service)
+        if (process.env.HTTP_PORT) {
+            const express = require('express');
+            const app = express();
+            
+            app.get('/health', (req, res) => {
+                const status = botManager.getBotStatus();
+                res.json({
+                    status: 'healthy',
+                    bots: status,
+                    timestamp: Date.now()
+                });
+            });
+            
+            app.get('/metrics', async (req, res) => {
+                const metrics = await redis.get('current_metrics');
+                res.json(metrics ? JSON.parse(metrics) : {});
+            });
+            
+            app.listen(process.env.HTTP_PORT, () => {
+                logger.info(`Health check server running on port ${process.env.HTTP_PORT}`);
+            });
+        }
+        
+    } catch (error) {
+        logger.error(`Failed to start bot system: ${error.message}`);
+        process.exit(1);
+    }
+}
