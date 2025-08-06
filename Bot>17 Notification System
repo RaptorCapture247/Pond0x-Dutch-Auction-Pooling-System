@@ -1,0 +1,102 @@
+// Notification System
+class NotificationManager {
+    constructor() {
+        this.channels = new Map();
+        this.templates = new Map();
+        this.setupTemplates();
+    }
+    
+    setupTemplates() {
+        this.templates.set('pool_created', {
+            title: 'New Pool Created',
+            message: 'Pool {poolId} created with goal {goal} PNDC',
+            priority: 'info'
+        });
+        
+        this.templates.set('goal_reached', {
+            title: 'Pool Goal Reached',
+            message: 'Pool {poolId} has reached its goal of {goal} PNDC!',
+            priority: 'info'
+        });
+        
+        this.templates.set('auction_started', {
+            title: 'Auction Started',
+            message: 'New auction started with {poolCount} eligible pools',
+            priority: 'high'
+        });
+        
+        this.templates.set('auction_won', {
+            title: 'Pool Won Auction',
+            message: 'Pool {poolId} won the auction with {amount} PNDC!',
+            priority: 'high'
+        });
+        
+        this.templates.set('system_error', {
+            title: 'System Error',
+            message: 'Error in {component}: {error}',
+            priority: 'critical'
+        });
+    }
+    
+    addChannel(name, handler) {
+        this.channels.set(name, handler);
+    }
+    
+    async notify(templateName, data, channels = ['default']) {
+        const template = this.templates.get(templateName);
+        
+        if (!template) {
+            logger.error(`Unknown notification template: ${templateName}`);
+            return;
+        }
+        
+        const message = this.renderTemplate(template.message, data);
+        const notification = {
+            title: this.renderTemplate(template.title, data),
+            message,
+            priority: template.priority,
+            timestamp: Date.now(),
+            data
+        };
+        
+        for (const channelName of channels) {
+            const handler = this.channels.get(channelName);
+            
+            if (handler) {
+                try {
+                    await handler(notification);
+                } catch (error) {
+                    logger.error(`Notification failed for channel ${channelName}: ${error.message}`);
+                }
+            }
+        }
+    }
+    
+    renderTemplate(template, data) {
+        return template.replace(/\{(\w+)\}/g, (match, key) => {
+            return data[key] || match;
+        });
+    }
+    
+    // Built-in notification channels
+    async webhookHandler(notification) {
+        if (CONFIG.monitoring.alertWebhook) {
+            await axios.post(CONFIG.monitoring.alertWebhook, {
+                title: notification.title,
+                text: notification.message,
+                priority: notification.priority,
+                timestamp: notification.timestamp
+            });
+        }
+    }
+    
+    async emailHandler(notification) {
+        // Email notification implementation
+        logger.info(`Email notification: ${notification.title}`);
+    }
+    
+    async discordHandler(notification) {
+        // Discord webhook implementation
+        logger.info(`Discord notification: ${notification.title}`);
+    }
+}
