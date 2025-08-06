@@ -1,0 +1,32 @@
+// Contract ABIs (simplified - you'll need the full ABIs)
+const ABIS = {
+    poolManager: [
+        "function getPoolInfo(uint256 poolId) view returns (address,uint256,uint256,uint256,bool,bool,bool,address)",
+        "function getEligiblePools() view returns (uint256[])",
+        "function isPoolEligibleForBid(uint256 poolId) view returns (bool)",
+        "function createPool(address,uint256,uint256,address) returns (uint256)",
+        "function contributeToPool(uint256,uint256)",
+        "function markPoolAsWinner(uint256)",
+        "function distributeRewards(uint256,address,uint256)",
+        "event PoolCreated(uint256 indexed,address indexed,address indexed,uint256,uint256,address)",
+        "event ContributionMade(uint256 indexed,address indexed,uint256,uint256)",
+        "event GoalReached(uint256 indexed,uint256)",
+        "event PoolWon(uint256 indexed,uint256)",
+        "event RewardsDistributed(uint256 indexed,address indexed,uint256)"
+    ],
+    auctionManager: [
+        "function startAuction(uint256)",
+        "function placeBid()",
+        "function getCurrentAuction() view returns (bool,uint256,uint256,uint256[],uint256,bool)",
+        "function endAuction()",
+        "event AuctionStarted(uint256 indexed,uint256,uint256[])",
+        "event BidPlaced(uint256 indexed,uint256 indexed,uint256)",
+        "event AuctionEnded(uint256 indexed,uint256,uint256)"
+    ],
+    rewardDistributor: [
+        "function processRewards(uint256,address,uint256,bool)",
+        "function addSupportedRewardToken(address)",
+        "event RewardsProcessed(uint256 indexed,address,uint256)",
+        "event SPLTokensBridged(address indexed,uint256,uint256)"
+    ]
+};
