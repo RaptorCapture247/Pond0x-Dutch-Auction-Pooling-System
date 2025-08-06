@@ -2,89 +2,9 @@
 A system designed to allow community members to launch and contribute to auction pools. System is designed to be permissionless and fully automated with the goal of creating a safe and efficient way for many users to contribute to pools.
 All smart contracts and automation bots are written using AI. Nothing here has been tested or checked.
 
-**Core System Components**
+## Core Contracts
 
-1. Pool Management
-Pool Creation: Users can create pools labeled with SPL or ERC-20 token addresses
-Multiple Pools: Same token can have multiple pools
-Goal Setting: 50B to 1T PNDC tokens in 50B increments
-Time Limits: 1-25 weeks for goal completion and auction winning
-Capacity: Maximum 1T tokens per pool
-
-2. User Participation
-Multi-pool Participation: Users can join multiple pools
-Repeated Contributions: Multiple contributions to same pool allowed
-Immediate Transfer: Tokens move to multisig wallet upon commitment
-
-3. Auction Integration
-Eligibility: Only pools meeting goals can bid
-Bidding Strategy: Largest pools bid first
-Pool Locking: Winning pools become locked
-Goal-Met Pools: Stop accepting new tokens during active auctions
-
-4. Reward Distribution
-Cross-chain Support: Handles both SPL and ERC-20 rewards
-Bridging: SPL tokens converted to ETH
-Fee Structure: 3% retained for gas costs
-Proportional Distribution: Based on user's percentage at bid time
-
-**Smart Contract Structure**
-
-PoolManager Contract:
-- Pool creation and management
-- Goal tracking and validation
-- Time limit enforcement
-- Eligibility determination
-
-UserManager Contract:
-- User contribution tracking
-- Multi-pool participation
-- Contribution history
-
-AuctionInterface Contract:
-- Bid submission logic
-- Pool prioritization
-- Auction state management
-
-RewardDistribution Contract:
-- Cross-chain reward handling
-- Proportional calculation
-- Distribution automation
-
-**Key Data Structures**
-- Pool metadata (goal, deadline, current amount, participants)
-- User contribution mapping (user → pool → amounts)
-- Auction state tracking
-- Reward distribution records
-
-**Critical Implementation Points**
-
-Security Considerations
-- Multisig Integration: Secure token storage with cross-chain capability
-- Reentrancy Protection: Prevent manipulation during contributions
-- Time-based Logic: Accurate deadline enforcement
-- Proportion Calculations: Precise reward distribution math
-
-Cross-chain Complexity
-- Bridge Integration: Reliable SPL to ETH conversion
-- Gas Management: Efficient use of 3% fee pool
-- Transaction Coordination: Synchronizing ERC-20 and SPL operations
-
-Scalability Concerns
-- Pool Limit Management: Preventing overflow beyond 1T tokens
-- Gas Optimization: Efficient batch operations for large pools
-- State Management: Tracking multiple active pools and users
-
-**Potential Challenges**
-
-- Cross-chain Reliability: Ensuring bridge operations don't fail
-- Auction Timing: Coordinating with external Pond0x auction system
-- Reward Calculation: Maintaining accuracy with multiple contributions
-- Gas Cost Management: Balancing 3% fee with actual operational costs
-
-**Core Contracts**
-
-1. PNDCPoolManager - Main pool management contract
+### 1. **PNDCPoolManager** - Main pool management contract
 - Pool creation with configurable goals (50B-1T PNDC in 50B increments)
 - Time-based pool expiration (1-25 weeks)
 - Multi-contribution support per user
@@ -92,69 +12,69 @@ Scalability Concerns
 - Reward distribution with 3% system fee
 - Emergency token return for expired pools
 
-2. AuctionManager - Handles dutch auction logic
+### 2. **AuctionManager** - Handles dutch auction logic
 - Auction lifecycle management
 - Largest-pool-first bidding priority
 - Winner selection and pool locking
 - Integration with external Pond0x auction system
 
-3. RewardDistributor - Cross-chain reward handling
+### 3. **RewardDistributor** - Cross-chain reward handling
 - SPL token bridging to ETH
 - ERC-20 reward distribution
 - Automatic system fee collection
 - Proportional reward calculation
 
-4. MultisigWalletManager - Secure token storage
+### 4. **MultisigWalletManager** - Secure token storage
 - Pool-specific multisig wallet management
 - Cross-chain wallet coordination
 - Authorization tracking
 
-5. BridgeContract - Cross-chain functionality
+### 5. **BridgeContract** - Cross-chain functionality
 - SPL ↔ ERC-20 token bridging
 - Transaction verification
 - Emergency withdrawal capabilities
 
-**Additional System Components**
+## Additional System Components
 
-6. PoolFactory - Standardized pool creation
+### 6. **PoolFactory** - Standardized pool creation
 - Fee-based pool creation
 - Authorization management
 - Integrated multisig setup
 
-7. PoolAnalytics - System statistics
+### 7. **PoolAnalytics** - System statistics
 - Pool performance tracking
 - User contribution analytics
 - Global system metrics
 
-8. EmergencyManager - System safety
+### 8. **EmergencyManager** - System safety
 - Emergency pause functionality
 - System-wide emergency mode
 - Multi-operator emergency response
 
-9. SystemGovernance - Decentralized governance
+### 9. **SystemGovernance** - Decentralized governance
 - Proposal creation and voting
 - Parameter updates through governance
 - Token-weighted voting system
 
-**Key Features Implemented**
+## Key Features Implemented
 
-✅ Pool Management: Create pools with goals, deadlines, and label tokens
-✅ Multi-contribution: Users can contribute to multiple pools multiple times
-✅ Auction Integration: Automatic bidding for eligible pools
-✅ Cross-chain Support: SPL token bridging and reward distribution
-✅ Security: Reentrancy protection, pausable contracts, emergency functions
-✅ Governance: Decentralized parameter updates and system management
-✅ Analytics: Comprehensive tracking of pool and user statistics
+✅ **Pool Management**: Create pools with goals, deadlines, and label tokens  
+✅ **Multi-contribution**: Users can contribute to multiple pools multiple times  
+✅ **Auction Integration**: Automatic bidding for eligible pools  
+✅ **Cross-chain Support**: SPL token bridging and reward distribution  
+✅ **Security**: Reentrancy protection, pausable contracts, emergency functions  
+✅ **Governance**: Decentralized parameter updates and system management  
+✅ **Analytics**: Comprehensive tracking of pool and user statistics  
 
-**Security Considerations**
+## Security Considerations
 
-- ReentrancyGuard: Prevents reentrancy attacks
-- SafeERC20: Secure token transfers
-- Pausable: Emergency system shutdown
-- Access Control: Role-based permissions
-- Input Validation: Comprehensive parameter checking
+- **ReentrancyGuard**: Prevents reentrancy attacks
+- **SafeERC20**: Secure token transfers
+- **Pausable**: Emergency system shutdown
+- **Access Control**: Role-based permissions
+- **Input Validation**: Comprehensive parameter checking
 
-**Deployment Order**
+## Deployment Order
 
 1. Deploy core token contracts
 2. Deploy PNDCPoolManager
@@ -163,6 +83,7 @@ Scalability Concerns
 5. Configure contract addresses and permissions
 6. Initialize system parameters
 
+The system is designed to be modular, upgradeable, and secure while handling the complex cross-chain operations and auction mechanics you specified. Each contract includes comprehensive events for monitoring and integration with your frontend.
 ## Core Bot Components
 
 ### 1. **Pond0xAuctionBot** - External Auction Monitor
