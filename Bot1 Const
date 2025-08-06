@@ -1,0 +1,10 @@
+// PNDC Bot System - Complete monitoring and automation system
+// This system includes multiple specialized bots for different aspects of the platform
+
+const Web3 = require('web3');
+const { ethers } = require('ethers');
+const axios = require('axios');
+const cron = require('node-cron');
+const winston = require('winston');
+const Redis = require('redis');
+const { Connection, PublicKey } = require('@solana/web3.js');
