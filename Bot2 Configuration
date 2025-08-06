@@ -1,0 +1,35 @@
+// Configuration
+const CONFIG = {
+    ethereum: {
+        rpcUrl: process.env.ETH_RPC_URL || 'https://mainnet.infura.io/v3/YOUR_KEY',
+        privateKey: process.env.ETH_PRIVATE_KEY,
+        gasPrice: process.env.GAS_PRICE || '20000000000', // 20 gwei
+        gasLimit: process.env.GAS_LIMIT || '500000'
+    },
+    solana: {
+        rpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+        privateKey: process.env.SOLANA_PRIVATE_KEY
+    },
+    contracts: {
+        poolManager: process.env.POOL_MANAGER_ADDRESS,
+        auctionManager: process.env.AUCTION_MANAGER_ADDRESS,
+        rewardDistributor: process.env.REWARD_DISTRIBUTOR_ADDRESS,
+        bridgeContract: process.env.BRIDGE_CONTRACT_ADDRESS,
+        pndcToken: process.env.PNDC_TOKEN_ADDRESS
+    },
+    pond0x: {
+        baseUrl: 'https://pond0x.com',
+        auctionEndpoint: '/mining/bid',
+        apiKey: process.env.POND0X_API_KEY
+    },
+    redis: {
+        host: process.env.REDIS_HOST || 'localhost',
+        port: process.env.REDIS_PORT || 6379,
+        password: process.env.REDIS_PASSWORD
+    },
+    monitoring: {
+        checkInterval: 30000, // 30 seconds
+        maxRetries: 3,
+        alertWebhook: process.env.ALERT_WEBHOOK_URL
+    }
+};
