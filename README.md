@@ -1,6 +1,58 @@
-# Pond0x-Dutch-Auction-Pooling-System
-A system designed to allow community members to launch and contribute to auction pools. System is designed to be permissionless and fully automated with the goal of creating a safe and efficient way for many users to contribute to pools.
-All smart contracts and automation bots are written using AI. Nothing here has been tested or checked.
+# PNDC Token Pooling System for Dutch Auction Bidding on Pond0x
+
+This document outlines the design of a system for pooling ERC-20 PNDC tokens into pools labeled with either an SPL or ERC-20 token contract address. These pools enable users to participate in Dutch auctions hosted by Pond0x at [pond0x.com/mining/bid](https://pond0x.com/mining/bid). The auction system is external and not part of this design.
+
+## System Overview
+The system allows users to:
+- Create or join pools labeled with an SPL or ERC-20 token contract address.
+- Pool PNDC tokens to bid in Dutch auctions.
+- Set pool goals and timeframes for bidding eligibility.
+- Store tokens in a multisig ERC-20 wallet linked to an SPL wallet.
+- Distribute auction rewards to users based on their contribution to the pool.
+
+## Pool Creation and Management
+- **Pool Creation**:
+  - Users can start a new pool by selecting an SPL or ERC-20 token contract address as the pool’s label.
+  - Multiple pools with the same token label can exist.
+  - Pools have a **maximum capacity of 1 trillion PNDC tokens**.
+  - **Pool Goals**:
+    - Users set a goal between **50 billion and 1 trillion PNDC tokens**, in increments of **50 billion**.
+    - Once the goal is reached, the pool becomes eligible to bid in the Dutch auction but can continue accepting tokens until it reaches 1 trillion or wins an auction.
+  - **Timeframe**:
+    - Users set a bidding timeframe between **1 week and 25 weeks**, in increments of **1 week**.
+    - If the pool does not reach its goal or win an auction within the timeframe, all tokens are returned to users proportional to their contributions.
+
+- **User Contributions**:
+  - Users can add PNDC tokens to multiple pools or the same pool multiple times, as long as the pool is open and active.
+  - Tokens are **immediately transferred** to a **multisig ERC-20 wallet** linked to an SPL wallet for secure storage.
+
+## Dutch Auction Bidding
+- **Eligibility**:
+  - Pools that meet their goal are eligible to bid in the Dutch auction hosted by Pond0x.
+  - Eligible pools pause accepting additional tokens when the auction goes live and resume after the auction closes, unless they reach the 1 trillion token cap.
+- **Bidding Process**:
+  - The **largest pools bid first** in the Dutch auction.
+  - The **first bid wins**, and the auction closes.
+  - If a pool wins, it is **locked**, and its tokens are sent to the auction.
+
+## Reward Distribution
+- **Reward Receipt**:
+  - Winning pools receive rewards in **SPL or ERC-20 tokens** from the auction.
+  - **SPL rewards** are bridged and swapped for **ETH**.
+- **Fee Retention**:
+  - **3% of rewards** are retained by the system, converted to ETH, and used to cover gas fees for transactions.
+- **Distribution**:
+  - After a set (currently unspecified) time, rewards are distributed to users based on their percentage of the total pool at the time the winning bid was placed.
+  - Rewards are sent to the wallet from which the user contributed tokens.
+- **Pool Closure**:
+  - Once all rewards are distributed, the pool is marked as **complete** and **permanently closed**.
+
+## Key Constraints
+- Maximum pool size and bid amount: **1 trillion PNDC tokens**.
+- Pool goals: **50 billion to 1 trillion PNDC tokens**, in **50 billion increments**.
+- Bidding timeframe: **1 to 25 weeks**, in **1-week increments**.
+- Tokens are stored in a **multisig ERC-20 wallet** linked to an SPL wallet.
+- The system does not include the Dutch auction itself, which is managed externally by Pond0x.
 
 ## Core Contracts
 
