@@ -4,7 +4,7 @@ All smart contracts and automation bots are written using AI. Nothing here has b
 
 ## Core Contracts
 
-### 1. **PNDCPoolManager** - Main pool management contract
+### 1. **PNDC Pool Manager** - Main pool management contract
 - Pool creation with configurable goals (50B-1T PNDC in 50B increments)
 - Time-based pool expiration (1-25 weeks)
 - Multi-contribution support per user
@@ -12,46 +12,46 @@ All smart contracts and automation bots are written using AI. Nothing here has b
 - Reward distribution with 3% system fee
 - Emergency token return for expired pools
 
-### 2. **AuctionManager** - Handles dutch auction logic
+### 2. **Auction Manager** - Handles dutch auction logic
 - Auction lifecycle management
 - Largest-pool-first bidding priority
 - Winner selection and pool locking
 - Integration with external Pond0x auction system
 
-### 3. **RewardDistributor** - Cross-chain reward handling
+### 3. **Reward Distributor** - Cross-chain reward handling
 - SPL token bridging to ETH
 - ERC-20 reward distribution
 - Automatic system fee collection
 - Proportional reward calculation
 
-### 4. **MultisigWalletManager** - Secure token storage
+### 4. **Multisig Wallet Manager** - Secure token storage
 - Pool-specific multisig wallet management
 - Cross-chain wallet coordination
 - Authorization tracking
 
-### 5. **BridgeContract** - Cross-chain functionality
+### 5. **Bridge Contract** - Cross-chain functionality
 - SPL ↔ ERC-20 token bridging
 - Transaction verification
 - Emergency withdrawal capabilities
 
 ## Additional System Components
 
-### 6. **PoolFactory** - Standardized pool creation
+### 6. **Pool Factory** - Standardized pool creation
 - Fee-based pool creation
 - Authorization management
 - Integrated multisig setup
 
-### 7. **PoolAnalytics** - System statistics
+### 7. **Pool Analytics** - System statistics
 - Pool performance tracking
 - User contribution analytics
 - Global system metrics
 
-### 8. **EmergencyManager** - System safety
+### 8. **Emergency Manager** - System safety
 - Emergency pause functionality
 - System-wide emergency mode
 - Multi-operator emergency response
 
-### 9. **SystemGovernance** - Decentralized governance
+### 9. **System Governance** - Decentralized governance
 - Proposal creation and voting
 - Parameter updates through governance
 - Token-weighted voting system
@@ -68,8 +68,8 @@ All smart contracts and automation bots are written using AI. Nothing here has b
 
 ## Security Considerations
 
-- **ReentrancyGuard**: Prevents reentrancy attacks
-- **SafeERC20**: Secure token transfers
+- **Reentrancy Guard**: Prevents reentrancy attacks
+- **Safe ERC20**: Secure token transfers
 - **Pausable**: Emergency system shutdown
 - **Access Control**: Role-based permissions
 - **Input Validation**: Comprehensive parameter checking
@@ -83,52 +83,52 @@ All smart contracts and automation bots are written using AI. Nothing here has b
 5. Configure contract addresses and permissions
 6. Initialize system parameters
 
-The system is designed to be modular, upgradeable, and secure while handling the complex cross-chain operations and auction mechanics you specified. Each contract includes comprehensive events for monitoring and integration with your frontend.
+
 ## Core Bot Components
 
-### 1. **Pond0xAuctionBot** - External Auction Monitor
+### 1. **Pond0x Auction Bot** - External Auction Monitor
 - Monitors Pond0x.com for live auctions
 - Automatically starts internal auctions when external ones begin
 - Coordinates auction timing and state management
 - Publishes auction events to other bots via Redis
 
-### 2. **PoolMonitorBot** - Pool State Tracking
+### 2. **Pool Monitor Bot** - Pool State Tracking
 - Tracks all pool states and activities
 - Listens for pool creation, contributions, and goal achievements
 - Monitors pool expiration and handles token returns
 - Updates Redis cache for real-time pool data
 
-### 3. **BiddingBot** - Automated Bidding Logic
+### 3. **Bidding Bot** - Automated Bidding Logic
 - Executes bidding strategy when auctions go live
 - Prioritizes largest pools for bidding
 - Implements smart timing and gas optimization
 - Places bids automatically based on pool eligibility
 
-### 4. **RewardDistributionBot** - Cross-chain Rewards
+### 4. **Reward Distribution Bot** - Cross-chain Rewards
 - Handles reward distribution after auction wins
 - Manages SPL token bridging to ETH
 - Processes reward calculations and distributions
 - Tracks pending rewards and completion status
 
-### 5. **BridgeBot** - Cross-chain Operations
+### 5. **Bridge Bot** - Cross-chain Operations
 - Monitors Solana network for bridge requests
 - Handles SPL ↔ ERC-20 token conversions
 - Processes bridge transactions automatically
 - Maintains bridge transaction history
 
-### 6. **HealthMonitorBot** - System Health
+### 6. **Health Monitor Bot** - System Health
 - Monitors all system components
 - Checks Ethereum and Solana connections
 - Validates contract health and Redis connectivity
 - Sends alerts for system issues
 
-### 7. **AnalyticsBot** - Data Collection & Reporting
+### 7. **Analytics Bot** - Data Collection & Reporting
 - Collects system metrics every 5 minutes
 - Generates hourly and daily reports
 - Tracks pool performance and user activity
 - Provides system optimization recommendations
 
-### 8. **SecurityMonitorBot** - Security & Anti-fraud
+### 8. **Security Monitor Bot** - Security & Anti-fraud
 - Detects suspicious contribution patterns
 - Monitors for potential bot behavior
 - Tracks unusual gas usage and failed transactions
@@ -136,25 +136,25 @@ The system is designed to be modular, upgradeable, and secure while handling the
 
 ## Supporting Infrastructure
 
-### **ConfigManager** - Dynamic Configuration
+### **Config Manager** - Dynamic Configuration
 - Environment variable integration
 - Runtime configuration updates
 - Configuration file management
 - Hot-reload capabilities
 
-### **DatabaseManager** - Persistent Storage
+### **Database Manager** - Persistent Storage
 - Pool and auction data storage
 - Transaction history tracking
 - System metrics archival
 - Analytics data management
 
-### **NotificationManager** - Alert System
+### **Notification Manager** - Alert System
 - Multi-channel notifications (Webhook, Email, Discord)
 - Template-based messaging
 - Priority-based alerting
 - Real-time system updates
 
-### **BotManager** - Orchestration
+### **Bot Manager** - Orchestration
 - Centralized bot management
 - Graceful startup and shutdown
 - Health monitoring and status reporting
