@@ -1,0 +1,150 @@
+// Bidding Bot
+class BiddingBot extends BaseBot {
+    constructor() {
+        super('BiddingBot');
+        this.isAuctionActive = false;
+        this.setupSubscriptions();
+    }
+    
+    setupSubscriptions() {
+        // Subscribe to auction events
+        const subscriber = redis.duplicate();
+        
+        subscriber.subscribe('auction_started', (message) => {
+            const data = JSON.parse(message);
+            this.handleAuctionStart(data);
+        });
+        
+        subscriber.subscribe('auction_ended', (message) => {
+            const data = JSON.parse(message);
+            this.handleAuctionEnd(data);
+        });
+    }
+    
+    async run() {
+        while (this.isRunning) {
+            if (this.isAuctionActive) {
+                await this.checkBiddingOpportunity();
+            }
+            await this.sleep(5000); // Check every 5 seconds during auctions
+        }
+    }
+    
+    async handleAuctionStart(auctionData) {
+        logger.info('Auction started, enabling bidding bot');
+        this.isAuctionActive = true;
+        
+        // Wait a moment for the blockchain to sync
+        await this.sleep(10000);
+        
+        await this.executeBiddingStrategy();
+    }
+    
+    async handleAuctionEnd(auctionData) {
+        logger.info('Auction ended, disabling bidding bot');
+        this.isAuctionActive = false;
+    }
+    
+    async executeBiddingStrategy() {
+        try {
+            // Get current auction state
+            const auctionState = await this.auctionManager.getCurrentAuction();
+            
+            if (!auctionState.isActive) {
+                logger.info('No active auction found');
+                return;
+            }
+            
+            // Check if we should bid
+            const shouldBid = await this.evaluateBiddingDecision(auctionState);
+            
+            if (shouldBid) {
+                await this.placeBid();
+            }
+            
+        } catch (error) {
+            logger.error(`Bidding strategy error: ${error.message}`);
+        }
+    }
+    
+    async evaluateBiddingDecision(auctionState) {
+        const eligiblePools = auctionState.eligiblePools;
+        
+        if (eligiblePools.length === 0) {
+            logger.info('No eligible pools for bidding');
+            return false;
+        }
+        
+        // Check if largest pool is significantly ahead
+        const poolInfos = await Promise.all(
+            eligiblePools.map(poolId => this.poolManager.getPoolInfo(poolId))
+        );
+        
+        // Sort by current amount
+        poolInfos.sort((a, b) => b.currentAmount.sub(a.currentAmount));
+        
+        const largestPool = poolInfos[0];
+        const secondLargest = poolInfos[1];
+        
+        // Only bid if largest pool has significant lead
+        if (secondLargest) {
+            const leadPercentage = largestPool.currentAmount
+                .sub(secondLargest.currentAmount)
+                .mul(100)
+                .div(largestPool.currentAmount);
+            
+            if (leadPercentage.lt(10)) { // Less than 10% lead
+                logger.info('Waiting for clearer leader before bidding');
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    async placeBid() {
+        try {
+            logger.info('Placing bid for largest eligible pool');
+            
+            const gasPrice = await this.provider.getGasPrice();
+            const tx = await this.auctionManager.placeBid({
+                gasPrice: gasPrice.mul(120).div(100), // 20% above current gas price
+                gasLimit: CONFIG.ethereum.gasLimit
+            });
+            
+            logger.info(`Bid placed: ${tx.hash}`);
+            
+            const receipt = await tx.wait();
+            
+            if (receipt.status === 1) {
+                logger.info(`Bid confirmed: ${tx.hash}`);
+                await this.sendAlert(`Bid successfully placed: ${tx.hash}`, 'info');
+            } else {
+                logger.error(`Bid failed: ${tx.hash}`);
+                await this.sendAlert(`Bid transaction failed: ${tx.hash}`, 'error');
+            }
+            
+        } catch (error) {
+            logger.error(`Failed to place bid: ${error.message}`);
+            await this.sendAlert(`Failed to place bid: ${error.message}`, 'error');
+        }
+    }
+    
+    async checkBiddingOpportunity() {
+        try {
+            const auctionState = await this.auctionManager.getCurrentAuction();
+            
+            if (auctionState.isActive && !auctionState.hasWinner) {
+                // Check if conditions are right for bidding
+                const timeRemaining = auctionState.endTime - (Date.now() / 1000);
+                
+                if (timeRemaining > 0 && timeRemaining < 300) { // Last 5 minutes
+                    await this.executeBiddingStrategy();
+                }
+            }
+            
+        } catch (error) {
+            logger.error(`Error checking bidding opportunity: ${error.message}`);
+        }
+    }
+}
