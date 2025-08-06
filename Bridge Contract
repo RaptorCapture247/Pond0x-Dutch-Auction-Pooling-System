@@ -1,0 +1,79 @@
+/**
+ * @title BridgeContract
+ * @dev Placeholder for cross-chain bridge functionality
+ */
+contract BridgeContract is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    
+    mapping(address => bool) public supportedTokens;
+    mapping(bytes32 => bool) public processedTransactions;
+    
+    event TokensBridged(address indexed token, uint256 amount, bytes32 txHash);
+    event TokensReceived(address indexed token, uint256 amount, bytes32 txHash);
+    
+    /**
+     * @dev Bridge tokens from SPL to ERC-20
+     */
+    function bridgeFromSPL(
+        address splToken,
+        address erc20Token,
+        uint256 amount,
+        bytes32 txHash
+    ) external onlyOwner nonReentrant {
+        require(supportedTokens[erc20Token], "Token not supported");
+        require(!processedTransactions[txHash], "Transaction already processed");
+        
+        processedTransactions[txHash] = true;
+        
+        // Mint or transfer ERC-20 tokens
+        IERC20(erc20Token).safeTransfer(msg.sender, amount);
+        
+        emit TokensReceived(erc20Token, amount, txHash);
+    }
+    
+    /**
+     * @dev Bridge tokens from ERC-20 to SPL
+     */
+    function bridgeToSPL(
+        address erc20Token,
+        address splToken,
+        uint256 amount
+    ) external nonReentrant {
+        require(supportedTokens[erc20Token], "Token not supported");
+        
+        // Burn or lock ERC-20 tokens
+        IERC20(erc20Token).safeTransferFrom(msg.sender, address(this), amount);
+        
+        bytes32 txHash = keccak256(abi.encodePacked(block.timestamp, msg.sender, amount));
+        
+        emit TokensBridged(erc20Token, amount, txHash);
+    }
+    
+    /**
+     * @dev Add supported token
+     */
+    function addSupportedToken(address token) external onlyOwner {
+        supportedTokens[token] = true;
+    }
+    
+    /**
+     * @dev Remove supported token
+     */
+    function removeSupportedToken(address token) external onlyOwner {
+        supportedTokens[token] = false;
+    }
+    
+    /**
+     * @dev Check if token is supported
+     */
+    function isTokenSupported(address token) external view returns (bool) {
+        return supportedTokens[token];
+    }
+    
+    /**
+     * @dev Emergency withdrawal
+     */
+    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
+        IERC20(token).safeTransfer(owner(), amount);
+    }
+}
