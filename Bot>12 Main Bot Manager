@@ -1,0 +1,73 @@
+// Main Bot Manager
+class BotManager {
+    constructor() {
+        this.bots = new Map();
+        this.isRunning = false;
+    }
+    
+    async initialize() {
+        // Initialize Redis
+        await redis.connect();
+        
+        // Create and register bots
+        this.registerBot('pond0x', new Pond0xAuctionBot());
+        this.registerBot('poolMonitor', new PoolMonitorBot());
+        this.registerBot('bidding', new BiddingBot());
+        this.registerBot('rewards', new RewardDistributionBot());
+        this.registerBot('bridge', new BridgeBot());
+        this.registerBot('health', new HealthMonitorBot());
+        
+        logger.info('Bot manager initialized');
+    }
+    
+    registerBot(name, bot) {
+        this.bots.set(name, bot);
+        logger.info(`Registered bot: ${name}`);
+    }
+    
+    async startAll() {
+        this.isRunning = true;
+        
+        for (const [name, bot] of this.bots) {
+            try {
+                await bot.start();
+                logger.info(`Started bot: ${name}`);
+            } catch (error) {
+                logger.error(`Failed to start bot ${name}: ${error.message}`);
+            }
+        }
+    }
+    
+    async stopAll() {
+        this.isRunning = false;
+        
+        for (const [name, bot] of this.bots) {
+            try {
+                await bot.stop();
+                logger.info(`Stopped bot: ${name}`);
+            } catch (error) {
+                logger.error(`Failed to stop bot ${name}: ${error.message}`);
+            }
+        }
+        
+        await redis.disconnect();
+    }
+    
+    getBot(name) {
+        return this.bots.get(name);
+    }
+    
+    getBotStatus() {
+        const status = {};
+        
+        for (const [name, bot] of this.bots) {
+            status[name] = {
+                isRunning: bot.isRunning,
+                retryCount: bot.retryCount,
+                name: bot.name
+            };
+        }
+        
+        return status;
+    }
+}
