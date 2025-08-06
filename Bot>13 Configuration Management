@@ -1,0 +1,80 @@
+// Configuration Management
+class ConfigManager {
+    constructor() {
+        this.config = { ...CONFIG };
+        this.watchers = new Map();
+    }
+    
+    get(key) {
+        return this.getNestedValue(this.config, key);
+    }
+    
+    set(key, value) {
+        this.setNestedValue(this.config, key, value);
+        this.notifyWatchers(key, value);
+    }
+    
+    watch(key, callback) {
+        if (!this.watchers.has(key)) {
+            this.watchers.set(key, []);
+        }
+        this.watchers.get(key).push(callback);
+    }
+    
+    notifyWatchers(key, value) {
+        const callbacks = this.watchers.get(key) || [];
+        callbacks.forEach(callback => {
+            try {
+                callback(value, key);
+            } catch (error) {
+                logger.error(`Config watcher error: ${error.message}`);
+            }
+        });
+    }
+    
+    getNestedValue(obj, key) {
+        return key.split('.').reduce((o, k) => (o || {})[k], obj);
+    }
+    
+    setNestedValue(obj, key, value) {
+        const keys = key.split('.');
+        const lastKey = keys.pop();
+        const target = keys.reduce((o, k) => o[k] = o[k] || {}, obj);
+        target[lastKey] = value;
+    }
+    
+    async loadFromEnvironment() {
+        // Override config with environment variables
+        const envMappings = {
+            'ETH_RPC_URL': 'ethereum.rpcUrl',
+            'ETH_PRIVATE_KEY': 'ethereum.privateKey',
+            'SOLANA_RPC_URL': 'solana.rpcUrl',
+            'POOL_MANAGER_ADDRESS': 'contracts.poolManager',
+            'AUCTION_MANAGER_ADDRESS': 'contracts.auctionManager',
+            'POND0X_API_KEY': 'pond0x.apiKey',
+            'REDIS_HOST': 'redis.host',
+            'ALERT_WEBHOOK_URL': 'monitoring.alertWebhook'
+        };
+        
+        for (const [envVar, configKey] of Object.entries(envMappings)) {
+            if (process.env[envVar]) {
+                this.set(configKey, process.env[envVar]);
+            }
+        }
+    }
+    
+    async saveToFile(filename) {
+        const fs = require('fs').promises;
+        await fs.writeFile(filename, JSON.stringify(this.config, null, 2));
+    }
+    
+    async loadFromFile(filename) {
+        const fs = require('fs').promises;
+        try {
+            const data = await fs.readFile(filename, 'utf8');
+            this.config = { ...this.config, ...JSON.parse(data) };
+        } catch (error) {
+            logger.warn(`Could not load config from ${filename}: ${error.message}`);
+        }
+    }
+}
