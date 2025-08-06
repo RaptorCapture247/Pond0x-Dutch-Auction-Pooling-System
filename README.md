@@ -2,6 +2,11 @@
 
 This document outlines the design of a system for pooling ERC-20 PNDC tokens into pools labeled with either an SPL or ERC-20 token contract address. These pools enable users to participate in Dutch auctions hosted by Pond0x at [pond0x.com/mining/bid](https://pond0x.com/mining/bid). The auction system is external and not part of this design.
 
+All code derived from AI
+[Smart contracts and management bots](https://claude.ai/share/7e052df8-cea0-4f62-ab18-392200d94115)
+
+[UI/App](https://v0.dev/chat/pndc-token-pools-k1Lj2g0y32Y)
+
 ## System Overview
 The system allows users to:
 - Create or join pools labeled with an SPL or ERC-20 token contract address.
