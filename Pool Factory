@@ -1,0 +1,108 @@
+/**
+ * @title PoolFactory
+ * @dev Factory contract for creating new pools with proper validation
+ */
+contract PoolFactory is Ownable {
+    
+    IPNDCPoolManager public poolManager;
+    MultisigWalletManager public walletManager;
+    
+    // Pool creation fees
+    uint256 public poolCreationFee;
+    mapping(address => bool) public authorizedCreators;
+    
+    event PoolCreated(
+        uint256 indexed poolId,
+        address indexed creator,
+        address indexed labelToken,
+        uint256 goal,
+        uint256 deadline
+    );
+    
+    event PoolCreationFeeUpdated(uint256 newFee);
+    event CreatorAuthorized(address indexed creator);
+    event CreatorRevoked(address indexed creator);
+    
+    modifier onlyAuthorized() {
+        require(authorizedCreators[msg.sender] || msg.sender == owner(), "Not authorized to create pools");
+        _;
+    }
+    
+    constructor(
+        address _poolManager,
+        address _walletManager,
+        uint256 _poolCreationFee
+    ) {
+        poolManager = IPNDCPoolManager(_poolManager);
+        walletManager = MultisigWalletManager(_walletManager);
+        poolCreationFee = _poolCreationFee;
+    }
+    
+    /**
+     * @dev Create a new pool with multisig wallet
+     */
+    function createPoolWithMultisig(
+        address labelToken,
+        uint256 goal,
+        uint256 durationWeeks,
+        address[] memory multisigOwners,
+        uint256 multisigThreshold,
+        address multisigWallet
+    ) external payable onlyAuthorized {
+        require(msg.value >= poolCreationFee, "Insufficient fee");
+        
+        // Create the pool
+        uint256 poolId = poolManager.createPool(
+            labelToken,
+            goal,
+            durationWeeks,
+            multisigWallet
+        );
+        
+        // Register the multisig wallet
+        walletManager.createMultisigWallet(
+            poolId,
+            multisigWallet,
+            multisigOwners,
+            multisigThreshold
+        );
+        
+        emit PoolCreated(poolId, msg.sender, labelToken, goal, block.timestamp + (durationWeeks * 604800));
+        
+        // Refund excess fee
+        if (msg.value > poolCreationFee) {
+            payable(msg.sender).transfer(msg.value - poolCreationFee);
+        }
+    }
+    
+    /**
+     * @dev Authorize address to create pools
+     */
+    function authorizeCreator(address creator) external onlyOwner {
+        authorizedCreators[creator] = true;
+        emit CreatorAuthorized(creator);
+    }
+    
+    /**
+     * @dev Revoke pool creation authorization
+     */
+    function revokeCreator(address creator) external onlyOwner {
+        authorizedCreators[creator] = false;
+        emit CreatorRevoked(creator);
+    }
+    
+    /**
+     * @dev Update pool creation fee
+     */
+    function updatePoolCreationFee(uint256 newFee) external onlyOwner {
+        poolCreationFee = newFee;
+        emit PoolCreationFeeUpdated(newFee);
+    }
+    
+    /**
+     * @dev Withdraw collected fees
+     */
+    function withdrawFees() external onlyOwner {
+        payable(owner()).transfer(address(this).balance);
+    }
+}
