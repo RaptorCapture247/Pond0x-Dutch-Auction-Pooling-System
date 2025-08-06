@@ -1,0 +1,107 @@
+/**
+ * @title PoolAnalytics
+ * @dev Contract for tracking pool analytics and statistics
+ */
+contract PoolAnalytics is Ownable {
+    
+    IPNDCPoolManager public poolManager;
+    
+    struct PoolStats {
+        uint256 totalContributions;
+        uint256 averageContribution;
+        uint256 uniqueContributors;
+        uint256 timeToGoal;
+        bool goalReached;
+        uint256 finalAmount;
+    }
+    
+    struct GlobalStats {
+        uint256 totalPools;
+        uint256 totalValueLocked;
+        uint256 successfulPools;
+        uint256 expiredPools;
+        uint256 totalRewardsDistributed;
+        uint256 totalUsers;
+    }
+    
+    mapping(uint256 => PoolStats) public poolStats;
+    mapping(address => uint256) public userTotalContributions;
+    mapping(address => uint256) public userPoolCount;
+    
+    GlobalStats public globalStats;
+    
+    event StatsUpdated(uint256 indexed poolId, uint256 newContribution);
+    event GlobalStatsUpdated(uint256 totalPools, uint256 totalValueLocked);
+    
+    constructor(address _poolManager) {
+        poolManager = IPNDCPoolManager(_poolManager);
+    }
+    
+    /**
+     * @dev Update stats when contribution is made
+     */
+    function updateContributionStats(
+        uint256 poolId,
+        address contributor,
+        uint256 amount
+    ) external {
+        require(msg.sender == address(poolManager), "Only pool manager can update stats");
+        
+        PoolStats storage stats = poolStats[poolId];
+        stats.totalContributions += amount;
+        
+        // Update user stats
+        if (userTotalContributions[contributor] == 0) {
+            globalStats.totalUsers++;
+        }
+        userTotalContributions[contributor] += amount;
+        
+        // Update global stats
+        globalStats.totalValueLocked += amount;
+        
+        emit StatsUpdated(poolId, amount);
+    }
+    
+    /**
+     * @dev Update stats when pool goal is reached
+     */
+    function updateGoalReachedStats(uint256 poolId) external {
+        require(msg.sender == address(poolManager), "Only pool manager can update stats");
+        
+        PoolStats storage stats = poolStats[poolId];
+        stats.goalReached = true;
+        stats.timeToGoal = block.timestamp;
+        
+        globalStats.successfulPools++;
+    }
+    
+    /**
+     * @dev Update stats when pool expires
+     */
+    function updateExpiredStats(uint256 poolId) external {
+        require(msg.sender == address(poolManager), "Only pool manager can update stats");
+        
+        globalStats.expiredPools++;
+    }
+    
+    /**
+     * @dev Get pool statistics
+     */
+    function getPoolStats(uint256 poolId) external view returns (PoolStats memory) {
+        return poolStats[poolId];
+    }
+    
+    /**
+     * @dev Get global statistics
+     */
+    function getGlobalStats() external view returns (GlobalStats memory) {
+        return globalStats;
+    }
+    
+    /**
+     * @dev Get user statistics
+     */
+    function getUserStats(address user) external view returns (uint256 totalContributions, uint256 poolCount) {
+        return (userTotalContributions[user], userPoolCount[user]);
+    }
+}
