@@ -1,0 +1,162 @@
+// Security Monitor Bot
+class SecurityMonitorBot extends BaseBot {
+    constructor() {
+        super('SecurityMonitorBot');
+        this.suspiciousActivities = new Map();
+        this.rateLimit = new Map();
+    }
+    
+    async run() {
+        // Monitor for suspicious activities
+        this.poolManager.on('ContributionMade', (poolId, contributor, amount) => {
+            this.checkContributionPattern(poolId, contributor, amount);
+        });
+        
+        this.poolManager.on('PoolCreated', (poolId, creator) => {
+            this.checkPoolCreationPattern(poolId, creator);
+        });
+        
+        while (this.isRunning) {
+            await this.performSecurityChecks();
+            await this.sleep(CONFIG.monitoring.checkInterval);
+        }
+    }
+    
+    async checkContributionPattern(poolId, contributor, amount) {
+        const key = `${contributor}-contributions`;
+        const now = Date.now();
+        
+        // Get recent contributions
+        let contributions = this.rateLimit.get(key) || [];
+        contributions = contributions.filter(c => now - c.timestamp < 3600000); // Last hour
+        
+        contributions.push({
+            poolId: poolId.toString(),
+            amount: amount.toString(),
+            timestamp: now
+        });
+        
+        this.rateLimit.set(key, contributions);
+        
+        // Check for suspicious patterns
+        if (contributions.length > 10) { // More than 10 contributions per hour
+            await this.flagSuspiciousActivity(contributor, 'high_frequency_contributions', {
+                count: contributions.length,
+                totalAmount: contributions.reduce((sum, c) => sum + parseInt(c.amount), 0)
+            });
+        }
+        
+        // Check for round number patterns (potential bot behavior)
+        const isRoundNumber = amount.toString().endsWith('000000000000000000'); // Ends with 18 zeros
+        if (isRoundNumber && contributions.filter(c => c.amount.endsWith('000000000000000000')).length > 3) {
+            await this.flagSuspiciousActivity(contributor, 'round_number_pattern', {
+                count: contributions.length
+            });
+        }
+    }
+    
+    async checkPoolCreationPattern(poolId, creator) {
+        const key = `${creator}-pools`;
+        const now = Date.now();
+        
+        let pools = this.rateLimit.get(key) || [];
+        pools = pools.filter(p => now - p.timestamp < 86400000); // Last 24 hours
+        
+        pools.push({
+            poolId: poolId.toString(),
+            timestamp: now
+        });
+        
+        this.rateLimit.set(key, pools);
+        
+        // Check for pool spam
+        if (pools.length > 5) { // More than 5 pools per day
+            await this.flagSuspiciousActivity(creator, 'excessive_pool_creation', {
+                count: pools.length
+            });
+        }
+    }
+    
+    async flagSuspiciousActivity(address, type, details) {
+        const key = `${address}-${type}`;
+        
+        if (this.suspiciousActivities.has(key)) {
+            return; // Already flagged
+        }
+        
+        this.suspiciousActivities.set(key, {
+            address,
+            type,
+            details,
+            timestamp: Date.now(),
+            status: 'flagged'
+        });
+        
+        logger.warn(`Suspicious activity detected: ${type} for ${address}`);
+        await this.sendAlert(`Suspicious activity: ${type} for ${address}`, 'warning');
+        
+        // Store in database for investigation
+        await this.dbManager.saveSuspiciousActivity({
+            address,
+            type,
+            details,
+            timestamp: Date.now()
+        });
+    }
+    
+    async performSecurityChecks() {
+        await Promise.all([
+            this.checkContractBalance(),
+            this.checkUnusualGasUsage(),
+            this.checkFailedTransactions(),
+            this.monitorLargeTransactions()
+        ]);
+    }
+    
+    async checkContractBalance() {
+        try {
+            const balance = await this.provider.getBalance(CONFIG.contracts.poolManager);
+            const balanceEth = ethers.utils.formatEther(balance);
+            
+            // Alert if contract balance is unexpectedly high (possible stuck funds)
+            if (parseFloat(balanceEth) > 10) { // More than 10 ETH
+                await this.sendAlert(`High contract balance detected: ${balanceEth} ETH`, 'warning');
+            }
+            
+        } catch (error) {
+            logger.error(`Failed contrast balance check: ${error.message}`);
+        }
+    }
+    
+    async checkUnusualGasUsage() {
+        // Monitor recent transactions for unusual gas usage patterns
+        const recentBlocks = [];
+        const currentBlock = await this.provider.getBlockNumber();
+        
+        for (let i = 0; i < 10; i++) {
+            const block = await this.provider.getBlock(currentBlock - i);
+            recentBlocks.push(block);
+        }
+        
+        // Analyze gas usage patterns
+        const avgGasUsed = recentBlocks.reduce((sum, block) => 
+            sum + block.gasUsed.toNumber(), 0) / recentBlocks.length;
+        
+        if (avgGasUsed > 10000000) { // 10M gas average
+            await this.sendAlert(`High average gas usage detected: ${avgGasUsed}`, 'warning');
+        }
+    }
+    
+    async checkFailedTransactions() {
+        // This would integrate with transaction monitoring
+        // to detect patterns of failed transactions
+    }
+    
+    async monitorLargeTransactions() {
+        // Monitor for unusually large contributions that might indicate manipulation
+        const largeTxThreshold = ethers.utils.parseEther('100000000'); // 100M PNDC
+        
+        // This would be implemented with event filtering
+        // to catch large contributions in real-time
+    }
+}
