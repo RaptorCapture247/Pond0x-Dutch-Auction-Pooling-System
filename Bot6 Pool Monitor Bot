@@ -1,0 +1,134 @@
+// Pool Monitor Bot
+class PoolMonitorBot extends BaseBot {
+    constructor() {
+        super('PoolMonitorBot');
+        this.trackedPools = new Map();
+        this.lastBlockProcessed = 0;
+    }
+    
+    async run() {
+        // Set up event listeners
+        this.setupEventListeners();
+        
+        while (this.isRunning) {
+            try {
+                await this.checkPoolStates();
+                await this.checkExpiredPools();
+                await this.sleep(CONFIG.monitoring.checkInterval);
+            } catch (error) {
+                logger.error(`Pool monitoring error: ${error.message}`);
+                await this.sleep(CONFIG.monitoring.checkInterval);
+            }
+        }
+    }
+    
+    setupEventListeners() {
+        // Listen for pool creation events
+        this.poolManager.on('PoolCreated', async (poolId, creator, labelToken, goal, deadline, multisigWallet) => {
+            logger.info(`New pool created: ${poolId.toString()}`);
+            
+            this.trackedPools.set(poolId.toString(), {
+                id: poolId.toString(),
+                creator,
+                labelToken,
+                goal: goal.toString(),
+                deadline: deadline.toString(),
+                multisigWallet,
+                lastChecked: Date.now()
+            });
+            
+            await this.sendAlert(`New pool created: ${poolId.toString()} with goal ${ethers.utils.formatEther(goal)} PNDC`, 'info');
+        });
+        
+        // Listen for goal reached events
+        this.poolManager.on('GoalReached', async (poolId, totalAmount) => {
+            logger.info(`Pool ${poolId.toString()} reached goal: ${ethers.utils.formatEther(totalAmount)} PNDC`);
+            
+            const pool = this.trackedPools.get(poolId.toString());
+            if (pool) {
+                pool.goalReached = true;
+                pool.currentAmount = totalAmount.toString();
+            }
+            
+            await this.sendAlert(`Pool ${poolId.toString()} reached goal!`, 'info');
+        });
+        
+        // Listen for contribution events
+        this.poolManager.on('ContributionMade', async (poolId, contributor, amount, newTotal) => {
+            logger.info(`Contribution made to pool ${poolId.toString()}: ${ethers.utils.formatEther(amount)} PNDC`);
+            
+            const pool = this.trackedPools.get(poolId.toString());
+            if (pool) {
+                pool.currentAmount = newTotal.toString();
+                pool.lastActivity = Date.now();
+            }
+        });
+        
+        // Listen for pool wins
+        this.poolManager.on('PoolWon', async (poolId, bidAmount) => {
+            logger.info(`Pool ${poolId.toString()} won auction with ${ethers.utils.formatEther(bidAmount)} PNDC`);
+            
+            const pool = this.trackedPools.get(poolId.toString());
+            if (pool) {
+                pool.hasWon = true;
+                pool.winAmount = bidAmount.toString();
+            }
+            
+            await this.sendAlert(`Pool ${poolId.toString()} won auction!`, 'info');
+        });
+    }
+    
+    async checkPoolStates() {
+        const eligiblePools = await this.poolManager.getEligiblePools();
+        
+        for (const poolId of eligiblePools) {
+            const poolInfo = await this.poolManager.getPoolInfo(poolId);
+            
+            // Update tracked pool data
+            const tracked = this.trackedPools.get(poolId.toString()) || {};
+            tracked.lastChecked = Date.now();
+            tracked.currentAmount = poolInfo.currentAmount.toString();
+            tracked.goalMet = poolInfo.goalMet;
+            tracked.hasWon = poolInfo.hasWon;
+            
+            this.trackedPools.set(poolId.toString(), tracked);
+            
+            // Store in Redis for other bots
+            await redis.setex(
+                `pool_${poolId}`,
+                3600,
+                JSON.stringify(tracked)
+            );
+        }
+    }
+    
+    async checkExpiredPools() {
+        const now = Date.now() / 1000;
+        
+        for (const [poolId, pool] of this.trackedPools) {
+            if (parseInt(pool.deadline) < now && !pool.hasWon && !pool.processed) {
+                await this.handleExpiredPool(poolId);
+            }
+        }
+    }
+    
+    async handleExpiredPool(poolId) {
+        try {
+            logger.info(`Processing expired pool: ${poolId}`);
+            
+            // This would trigger the return of tokens to users
+            // In practice, this might require multisig approval
+            
+            const pool = this.trackedPools.get(poolId);
+            if (pool) {
+                pool.processed = true;
+                pool.expired = true;
+            }
+            
+            await this.sendAlert(`Pool ${poolId} has expired`, 'warning');
+            
+        } catch (error) {
+            logger.error(`Failed to process expired pool ${poolId}: ${error.message}`);
+        }
+    }
+}
