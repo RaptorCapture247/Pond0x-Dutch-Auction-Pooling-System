@@ -1,0 +1,116 @@
+// Pond0x Auction Monitor Bot
+class Pond0xAuctionBot extends BaseBot {
+    constructor() {
+        super('Pond0xAuctionBot');
+        this.lastAuctionCheck = 0;
+        this.currentAuction = null;
+    }
+    
+    async run() {
+        while (this.isRunning) {
+            try {
+                await this.checkForAuctions();
+                await this.sleep(CONFIG.monitoring.checkInterval);
+            } catch (error) {
+                logger.error(`Pond0x auction monitoring error: ${error.message}`);
+                await this.sendAlert(`Auction monitoring failed: ${error.message}`, 'error');
+                await this.sleep(CONFIG.monitoring.checkInterval);
+            }
+        }
+    }
+    
+    async checkForAuctions() {
+        const auctionData = await this.retry(
+            () => this.fetchAuctionData(),
+            'fetching auction data'
+        );
+        
+        if (auctionData.isActive && !this.currentAuction) {
+            // New auction detected
+            await this.handleNewAuction(auctionData);
+        } else if (!auctionData.isActive && this.currentAuction) {
+            // Auction ended
+            await this.handleAuctionEnd();
+        }
+        
+        this.currentAuction = auctionData.isActive ? auctionData : null;
+    }
+    
+    async fetchAuctionData() {
+        const response = await axios.get(
+            `${CONFIG.pond0x.baseUrl}/api/auction/status`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${CONFIG.pond0x.apiKey}`
+                }
+            }
+        );
+        
+        return response.data;
+    }
+    
+    async handleNewAuction(auctionData) {
+        logger.info('New Pond0x auction detected', auctionData);
+        
+        // Store auction data in Redis
+        await redis.setex(
+            'current_auction',
+            auctionData.duration || 3600,
+            JSON.stringify(auctionData)
+        );
+        
+        // Start our auction manager
+        await this.startInternalAuction(auctionData);
+        
+        await this.sendAlert(
+            `New auction started: ${auctionData.id} - Duration: ${auctionData.duration}s`,
+            'info'
+        );
+    }
+    
+    async startInternalAuction(auctionData) {
+        try {
+            const tx = await this.auctionManager.startAuction(auctionData.duration);
+            await tx.wait();
+            
+            logger.info(`Internal auction started: ${tx.hash}`);
+            
+            // Notify other bots
+            await redis.publish('auction_started', JSON.stringify({
+                auctionId: auctionData.id,
+                duration: auctionData.duration,
+                txHash: tx.hash
+            }));
+            
+        } catch (error) {
+            logger.error(`Failed to start internal auction: ${error.message}`);
+            await this.sendAlert(`Failed to start internal auction: ${error.message}`, 'error');
+        }
+    }
+    
+    async handleAuctionEnd() {
+        logger.info('Pond0x auction ended');
+        
+        // Clean up Redis
+        await redis.del('current_auction');
+        
+        // End internal auction
+        try {
+            const tx = await this.auctionManager.endAuction();
+            await tx.wait();
+            
+            logger.info(`Internal auction ended: ${tx.hash}`);
+            
+            // Notify other bots
+            await redis.publish('auction_ended', JSON.stringify({
+                txHash: tx.hash,
+                timestamp: Date.now()
+            }));
+            
+        } catch (error) {
+            logger.error(`Failed to end internal auction: ${error.message}`);
+        }
+        
+        await this.sendAlert('Auction ended', 'info');
+    }
+}
