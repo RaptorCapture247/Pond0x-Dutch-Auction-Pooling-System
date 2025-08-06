@@ -1,0 +1,66 @@
+// Cross-Chain Bridge Bot
+class BridgeBot extends BaseBot {
+    constructor() {
+        super('BridgeBot');
+        this.pendingBridges = new Map();
+    }
+    
+    async run() {
+        // Listen for SPL token bridging events
+        this.rewardDistributor.on('SPLTokensBridged', async (splToken, amount, ethReceived) => {
+            await this.handleSPLBridge(splToken, amount, ethReceived);
+        });
+        
+        while (this.isRunning) {
+            await this.checkBridgeStatus();
+            await this.sleep(CONFIG.monitoring.checkInterval);
+        }
+    }
+    
+    async handleSPLBridge(splToken, amount, ethReceived) {
+        logger.info(`SPL tokens bridged: ${amount} -> ${ethReceived} ETH`);
+        
+        // Monitor bridge transaction
+        this.pendingBridges.set(`${splToken}-${Date.now()}`, {
+            splToken,
+            amount: amount.toString(),
+            ethReceived: ethReceived.toString(),
+            timestamp: Date.now(),
+            status: 'bridged'
+        });
+    }
+    
+    async checkBridgeStatus() {
+        // Monitor Solana network for incoming bridge requests
+        try {
+            // This would implement actual Solana monitoring
+            // For now, it's a placeholder
+            
+            const recentTransactions = await this.getSolanaTransactions();
+            
+            for (const tx of recentTransactions) {
+                if (this.isBridgeTransaction(tx)) {
+                    await this.processBridgeRequest(tx);
+                }
+            }
+            
+        } catch (error) {
+            logger.error(`Bridge monitoring error: ${error.message}`);
+        }
+    }
+    
+    async getSolanaTransactions() {
+        // Placeholder for Solana transaction monitoring
+        return [];
+    }
+    
+    isBridgeTransaction(tx) {
+        // Check if transaction is a bridge request
+        return false;
+    }
+    
+    async processBridgeRequest(tx) {
+        // Process incoming bridge request
+        logger.info(`Processing bridge request: ${tx.signature}`);
+    }
+}
