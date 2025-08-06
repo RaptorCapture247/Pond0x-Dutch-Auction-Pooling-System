@@ -1,0 +1,98 @@
+/**
+ * @title AuctionManager
+ * @dev Manages the auction process and bidding logic
+ */
+contract AuctionManager is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    
+    IPNDCPoolManager public poolManager;
+    IERC20 public pndcToken;
+    
+    PoolStructs.AuctionState public currentAuction;
+    
+    event AuctionStarted(uint256 indexed auctionId, uint256 startTime, uint256[] eligiblePools);
+    event BidPlaced(uint256 indexed auctionId, uint256 indexed poolId, uint256 amount);
+    event AuctionEnded(uint256 indexed auctionId, uint256 winningPool, uint256 winningAmount);
+    
+    constructor(address _poolManager, address _pndcToken) {
+        poolManager = IPNDCPoolManager(_poolManager);
+        pndcToken = IERC20(_pndcToken);
+    }
+    
+    /**
+     * @dev Start a new auction
+     */
+    function startAuction(uint256 duration) external onlyOwner {
+        require(!currentAuction.isActive, "Auction already active");
+        
+        // Get eligible pools from pool manager
+        uint256[] memory eligiblePools = PNDCPoolManager(address(poolManager)).getEligiblePools();
+        require(eligiblePools.length > 0, "No eligible pools");
+        
+        currentAuction.isActive = true;
+        currentAuction.startTime = block.timestamp;
+        currentAuction.endTime = block.timestamp + duration;
+        currentAuction.eligiblePools = eligiblePools;
+        currentAuction.hasWinner = false;
+        currentAuction.winningPool = 0;
+        
+        emit AuctionStarted(block.timestamp, block.timestamp, eligiblePools);
+    }
+    
+    /**
+     * @dev Place bid for the highest eligible pool
+     */
+    function placeBid() external nonReentrant {
+        require(currentAuction.isActive, "No active auction");
+        require(block.timestamp <= currentAuction.endTime, "Auction has ended");
+        require(!currentAuction.hasWinner, "Auction already has winner");
+        
+        // Get the largest eligible pool
+        uint256 winningPoolId = currentAuction.eligiblePools[0];
+        
+        // Mark pool as winner
+        poolManager.markPoolAsWinner(winningPoolId);
+        
+        // Update auction state
+        currentAuction.hasWinner = true;
+        currentAuction.winningPool = winningPoolId;
+        currentAuction.isActive = false;
+        
+        // Get pool info for bid amount
+        (, , uint256 bidAmount, , , , , ) = poolManager.getPoolInfo(winningPoolId);
+        
+        emit BidPlaced(currentAuction.startTime, winningPoolId, bidAmount);
+        emit AuctionEnded(currentAuction.startTime, winningPoolId, bidAmount);
+    }
+    
+    /**
+     * @dev End auction manually
+     */
+    function endAuction() external onlyOwner {
+        require(currentAuction.isActive, "No active auction");
+        currentAuction.isActive = false;
+        
+        emit AuctionEnded(currentAuction.startTime, currentAuction.winningPool, 0);
+    }
+    
+    /**
+     * @dev Get current auction state
+     */
+    function getCurrentAuction() external view returns (
+        bool isActive,
+        uint256 startTime,
+        uint256 endTime,
+        uint256[] memory eligiblePools,
+        uint256 winningPool,
+        bool hasWinner
+    ) {
+        return (
+            currentAuction.isActive,
+            currentAuction.startTime,
+            currentAuction.endTime,
+            currentAuction.eligiblePools,
+            currentAuction.winningPool,
+            currentAuction.hasWinner
+        );
+    }
+}
