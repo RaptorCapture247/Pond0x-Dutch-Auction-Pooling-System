@@ -1,0 +1,65 @@
+/**
+ * @title MultisigWalletManager
+ * @dev Manages multisig wallets for each pool
+ */
+contract MultisigWalletManager is Ownable {
+    
+    struct MultisigWallet {
+        address walletAddress;
+        address[] owners;
+        uint256 threshold;
+        bool isActive;
+    }
+    
+    mapping(uint256 => MultisigWallet) public poolWallets;
+    mapping(address => bool) public authorizedWallets;
+    
+    event MultisigWalletCreated(uint256 indexed poolId, address walletAddress, address[] owners, uint256 threshold);
+    event MultisigWalletUpdated(uint256 indexed poolId, address newWalletAddress);
+    
+    /**
+     * @dev Create a multisig wallet for a pool
+     */
+    function createMultisigWallet(
+        uint256 poolId,
+        address walletAddress,
+        address[] memory owners,
+        uint256 threshold
+    ) external onlyOwner {
+        require(owners.length >= threshold, "Invalid threshold");
+        require(threshold > 0, "Threshold must be greater than 0");
+        
+        MultisigWallet storage wallet = poolWallets[poolId];
+        wallet.walletAddress = walletAddress;
+        wallet.owners = owners;
+        wallet.threshold = threshold;
+        wallet.isActive = true;
+        
+        authorizedWallets[walletAddress] = true;
+        
+        emit MultisigWalletCreated(poolId, walletAddress, owners, threshold);
+    }
+    
+    /**
+     * @dev Update multisig wallet for a pool
+     */
+    function updateMultisigWallet(uint256 poolId, address newWalletAddress) external onlyOwner {
+        require(poolWallets[poolId].walletAddress != address(0), "Wallet does not exist");
+        
+        // Deauthorize old wallet
+        authorizedWallets[poolWallets[poolId].walletAddress] = false;
+        
+        // Authorize new wallet
+        poolWallets[poolId].walletAddress = newWalletAddress;
+        authorizedWallets[newWalletAddress] = true;
+        
+        emit MultisigWalletUpdated(poolId, newWalletAddress);
+    }
+    
+    /**
+     * @dev Check if wallet is authorized
+     */
+    function isAuthorizedWallet(address wallet) external view returns (bool) {
+        return authorizedWallets[wallet];
+    }
+}
