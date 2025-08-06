@@ -1,0 +1,97 @@
+// Redis client for caching and coordination
+const redis = Redis.createClient(CONFIG.redis);
+
+// Base Bot Class
+class BaseBot {
+    constructor(name) {
+        this.name = name;
+        this.isRunning = false;
+        this.retryCount = 0;
+        this.maxRetries = CONFIG.monitoring.maxRetries;
+        
+        // Initialize Web3 and ethers
+        this.web3 = new Web3(CONFIG.ethereum.rpcUrl);
+        this.provider = new ethers.providers.JsonRpcProvider(CONFIG.ethereum.rpcUrl);
+        this.wallet = new ethers.Wallet(CONFIG.ethereum.privateKey, this.provider);
+        
+        // Initialize Solana connection
+        this.solanaConnection = new Connection(CONFIG.solana.rpcUrl);
+        
+        // Initialize contracts
+        this.initializeContracts();
+    }
+    
+    initializeContracts() {
+        this.poolManager = new ethers.Contract(
+            CONFIG.contracts.poolManager,
+            ABIS.poolManager,
+            this.wallet
+        );
+        
+        this.auctionManager = new ethers.Contract(
+            CONFIG.contracts.auctionManager,
+            ABIS.auctionManager,
+            this.wallet
+        );
+        
+        this.rewardDistributor = new ethers.Contract(
+            CONFIG.contracts.rewardDistributor,
+            ABIS.rewardDistributor,
+            this.wallet
+        );
+    }
+    
+    async start() {
+        logger.info(`Starting ${this.name} bot`);
+        this.isRunning = true;
+        await this.run();
+    }
+    
+    async stop() {
+        logger.info(`Stopping ${this.name} bot`);
+        this.isRunning = false;
+    }
+    
+    async run() {
+        // Override in subclasses
+        throw new Error('run() method must be implemented');
+    }
+    
+    async retry(operation, context = '') {
+        let lastError;
+        
+        for (let i = 0; i < this.maxRetries; i++) {
+            try {
+                return await operation();
+            } catch (error) {
+                lastError = error;
+                logger.warn(`Retry ${i + 1}/${this.maxRetries} failed for ${context}: ${error.message}`);
+                
+                if (i < this.maxRetries - 1) {
+                    await this.sleep(1000 * Math.pow(2, i)); // Exponential backoff
+                }
+            }
+        }
+        
+        throw lastError;
+    }
+    
+    async sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+    
+    async sendAlert(message, level = 'warning') {
+        try {
+            if (CONFIG.monitoring.alertWebhook) {
+                await axios.post(CONFIG.monitoring.alertWebhook, {
+                    text: `[${level.toUpperCase()}] ${this.name}: ${message}`,
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
+            logger.log(level, message);
+        } catch (error) {
+            logger.error(`Failed to send alert: ${error.message}`);
+        }
+    }
+}
