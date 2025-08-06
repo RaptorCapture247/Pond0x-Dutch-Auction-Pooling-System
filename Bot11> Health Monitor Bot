@@ -1,0 +1,90 @@
+// Health Monitor Bot
+class HealthMonitorBot extends BaseBot {
+    constructor() {
+        super('HealthMonitorBot');
+        this.healthChecks = new Map();
+    }
+    
+    async run() {
+        while (this.isRunning) {
+            await this.performHealthChecks();
+            await this.sleep(CONFIG.monitoring.checkInterval);
+        }
+    }
+    
+    async performHealthChecks() {
+        const checks = [
+            this.checkEthereumConnection(),
+            this.checkSolanaConnection(),
+            this.checkContractHealth(),
+            this.checkRedisConnection(),
+            this.checkExternalAPIs()
+        ];
+        
+        const results = await Promise.allSettled(checks);
+        
+        results.forEach((result, index) => {
+            const checkName = ['ethereum', 'solana', 'contracts', 'redis', 'apis'][index];
+            
+            if (result.status === 'rejected') {
+                logger.error(`Health check failed for ${checkName}: ${result.reason.message}`);
+                this.sendAlert(`Health check failed for ${checkName}`, 'error');
+            } else {
+                this.healthChecks.set(checkName, {
+                    status: 'healthy',
+                    lastCheck: Date.now(),
+                    details: result.value
+                });
+            }
+        });
+    }
+    
+    async checkEthereumConnection() {
+        const blockNumber = await this.provider.getBlockNumber();
+        const balance = await this.provider.getBalance(this.wallet.address);
+        
+        return {
+            blockNumber,
+            balance: balance.toString(),
+            walletAddress: this.wallet.address
+        };
+    }
+    
+    async checkSolanaConnection() {
+        const blockHeight = await this.solanaConnection.getBlockHeight();
+        
+        return {
+            blockHeight,
+            endpoint: CONFIG.solana.rpcUrl
+        };
+    }
+    
+    async checkContractHealth() {
+        const poolCount = await this.poolManager.nextPoolId();
+        const auctionState = await this.auctionManager.getCurrentAuction();
+        
+        return {
+            poolCount: poolCount.toString(),
+            auctionActive: auctionState.isActive
+        };
+    }
+    
+    async checkRedisConnection() {
+        await redis.ping();
+        
+        return {
+            status: 'connected',
+            host: CONFIG.redis.host,
+            port: CONFIG.redis.port
+        };
+    }
+    
+    async checkExternalAPIs() {
+        const response = await axios.get(`${CONFIG.pond0x.baseUrl}/api/health`);
+        
+        return {
+            pond0x: response.status === 200,
+            responseTime: response.headers['response-time']
+        };
+    }
+}
