@@ -1,0 +1,119 @@
+/**
+ * @title EmergencyManager
+ * @dev Handles emergency situations and system maintenance
+ */
+contract EmergencyManager is Ownable {
+    
+    IPNDCPoolManager public poolManager;
+    AuctionManager public auctionManager;
+    RewardDistributor public rewardDistributor;
+    
+    bool public systemPaused;
+    bool public emergencyMode;
+    
+    mapping(address => bool) public emergencyOperators;
+    
+    event SystemPaused(address indexed operator);
+    event SystemUnpaused(address indexed operator);
+    event EmergencyModeActivated(address indexed operator);
+    event EmergencyModeDeactivated(address indexed operator);
+    event EmergencyOperatorAdded(address indexed operator);
+    event EmergencyOperatorRemoved(address indexed operator);
+    
+    modifier onlyEmergencyOperator() {
+        require(emergencyOperators[msg.sender] || msg.sender == owner(), "Not authorized");
+        _;
+    }
+    
+    modifier notInEmergencyMode() {
+        require(!emergencyMode, "System in emergency mode");
+        _;
+    }
+    
+    constructor(
+        address _poolManager,
+        address _auctionManager,
+        address _rewardDistributor
+    ) {
+        poolManager = IPNDCPoolManager(_poolManager);
+        auctionManager = AuctionManager(_auctionManager);
+        rewardDistributor = RewardDistributor(_rewardDistributor);
+        
+        emergencyOperators[msg.sender] = true;
+    }
+    
+    /**
+     * @dev Pause entire system
+     */
+    function pauseSystem() external onlyEmergencyOperator {
+        systemPaused = true;
+        
+        // Pause all contracts
+        PNDCPoolManager(address(poolManager)).pause();
+        
+        emit SystemPaused(msg.sender);
+    }
+    
+    /**
+     * @dev Unpause system
+     */
+    function unpauseSystem() external onlyEmergencyOperator {
+        systemPaused = false;
+        
+        // Unpause all contracts
+        PNDCPoolManager(address(poolManager)).unpause();
+        
+        emit SystemUnpaused(msg.sender);
+    }
+    
+    /**
+     * @dev Activate emergency mode
+     */
+    function activateEmergencyMode() external onlyEmergencyOperator {
+        emergencyMode = true;
+        pauseSystem();
+        
+        emit EmergencyModeActivated(msg.sender);
+    }
+    
+    /**
+     * @dev Deactivate emergency mode
+     */
+    function deactivateEmergencyMode() external onlyOwner {
+        emergencyMode = false;
+        unpauseSystem();
+        
+        emit EmergencyModeDeactivated(msg.sender);
+    }
+    
+    /**
+     * @dev Add emergency operator
+     */
+    function addEmergencyOperator(address operator) external onlyOwner {
+        emergencyOperators[operator] = true;
+        emit EmergencyOperatorAdded(operator);
+    }
+    
+    /**
+     * @dev Remove emergency operator
+     */
+    function removeEmergencyOperator(address operator) external onlyOwner {
+        emergencyOperators[operator] = false;
+        emit EmergencyOperatorRemoved(operator);
+    }
+    
+    /**
+     * @dev Emergency withdrawal from any contract
+     */
+    function emergencyWithdraw(
+        address contractAddress,
+        address token,
+        uint256 amount,
+        address recipient
+    ) external onlyOwner {
+        require(emergencyMode, "Emergency mode not active");
+        
+        // This would call emergency withdrawal functions on target contracts
+        // Implementation depends on specific contract interfaces
+    }
+}
