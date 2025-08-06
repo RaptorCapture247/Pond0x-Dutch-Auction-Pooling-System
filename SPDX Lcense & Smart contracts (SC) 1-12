@@ -1,0 +1,1355 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title IPNDCPoolManager
+ * @dev Interface for the main pool management contract
+ */
+interface IPNDCPoolManager {
+    function getPoolInfo(uint256 poolId) external view returns (
+        address labelToken,
+        uint256 goal,
+        uint256 currentAmount,
+        uint256 deadline,
+        bool isActive,
+        bool goalMet,
+        bool hasWon,
+        address multisigWallet
+    );
+    
+    function isPoolEligibleForBid(uint256 poolId) external view returns (bool);
+    function markPoolAsWinner(uint256 poolId) external;
+    function distributeRewards(uint256 poolId, address rewardToken, uint256 amount) external;
+}
+
+/**
+ * @title PoolStructs
+ * @dev Library containing all data structures used across contracts
+ */
+library PoolStructs {
+    struct Pool {
+        address labelToken;         // SPL or ERC-20 token address this pool represents
+        uint256 goal;              // Target amount (50B to 1T PNDC)
+        uint256 currentAmount;     // Current pooled amount
+        uint256 deadline;          // Timestamp when pool expires
+        bool isActive;             // Whether pool is accepting contributions
+        bool goalMet;              // Whether goal has been reached
+        bool hasWon;               // Whether pool won an auction
+        bool isComplete;           // Whether pool is permanently closed
+        address multisigWallet;    // Associated multisig wallet
+        mapping(address => uint256) contributions; // User contributions
+        address[] contributors;    // List of all contributors
+        uint256 totalContributors; // Count of unique contributors
+        uint256 rewardAmount;      // Total rewards received
+        address rewardToken;       // Token used for rewards
+        bool rewardsDistributed;   // Whether rewards have been distributed
+    }
+    
+    struct UserContribution {
+        uint256 amount;
+        uint256 timestamp;
+        bool rewardsClaimed;
+    }
+    
+    struct AuctionState {
+        bool isActive;
+        uint256 startTime;
+        uint256 endTime;
+        uint256[] eligiblePools;
+        uint256 winningPool;
+        bool hasWinner;
+    }
+}
+
+/**
+ * @title PNDCPoolManager
+ * @dev Main contract for managing PNDC token pools
+ */
+contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable {
+    using SafeERC20 for IERC20;
+    using SafeMath for uint256;
+    
+    // Constants
+    uint256 public constant MIN_GOAL = 50_000_000_000 * 10**18; // 50 billion PNDC
+    uint256 public constant MAX_GOAL = 1_000_000_000_000 * 10**18; // 1 trillion PNDC
+    uint256 public constant GOAL_INCREMENT = 50_000_000_000 * 10**18; // 50 billion increments
+    uint256 public constant MAX_POOL_AMOUNT = 1_000_000_000_000 * 10**18; // 1 trillion max
+    uint256 public constant MIN_WEEKS = 1;
+    uint256 public constant MAX_WEEKS = 25;
+    uint256 public constant WEEK_IN_SECONDS = 604800; // 1 week in seconds
+    uint256 public constant SYSTEM_FEE_PERCENTAGE = 3; // 3% system fee
+    
+    // State variables
+    IERC20 public pndcToken;
+    address public auctionManager;
+    address public rewardDistributor;
+    address public bridgeContract;
+    uint256 public nextPoolId;
+    
+    // Mappings
+    mapping(uint256 => PoolStructs.Pool) public pools;
+    mapping(address => uint256[]) public userPools; // User's participated pools
+    mapping(uint256 => mapping(address => PoolStructs.UserContribution[])) public userContributions;
+    
+    // Events
+    event PoolCreated(
+        uint256 indexed poolId,
+        address indexed creator,
+        address indexed labelToken,
+        uint256 goal,
+        uint256 deadline,
+        address multisigWallet
+    );
+    
+    event ContributionMade(
+        uint256 indexed poolId,
+        address indexed contributor,
+        uint256 amount,
+        uint256 newTotal
+    );
+    
+    event GoalReached(uint256 indexed poolId, uint256 totalAmount);
+    event PoolWon(uint256 indexed poolId, uint256 bidAmount);
+    event RewardsReceived(uint256 indexed poolId, address rewardToken, uint256 amount);
+    event RewardsDistributed(uint256 indexed poolId, address indexed user, uint256 amount);
+    event PoolExpired(uint256 indexed poolId);
+    event TokensReturned(uint256 indexed poolId, address indexed user, uint256 amount);
+    
+    // Modifiers
+    modifier onlyAuctionManager() {
+        require(msg.sender == auctionManager, "Only auction manager can call this");
+        _;
+    }
+    
+    modifier onlyRewardDistributor() {
+        require(msg.sender == rewardDistributor, "Only reward distributor can call this");
+        _;
+    }
+    
+    modifier validPool(uint256 poolId) {
+        require(poolId < nextPoolId, "Pool does not exist");
+        _;
+    }
+    
+    modifier poolActive(uint256 poolId) {
+        require(pools[poolId].isActive, "Pool is not active");
+        require(block.timestamp <= pools[poolId].deadline, "Pool has expired");
+        require(!pools[poolId].isComplete, "Pool is complete");
+        _;
+    }
+    
+    constructor(
+        address _pndcToken,
+        address _auctionManager,
+        address _rewardDistributor,
+        address _bridgeContract
+    ) {
+        pndcToken = IERC20(_pndcToken);
+        auctionManager = _auctionManager;
+        rewardDistributor = _rewardDistributor;
+        bridgeContract = _bridgeContract;
+        nextPoolId = 1;
+    }
+    
+    /**
+     * @dev Create a new pool
+     * @param labelToken The SPL or ERC-20 token address this pool represents
+     * @param goal Target amount for the pool (must be between MIN_GOAL and MAX_GOAL)
+     * @param durationWeeks How many weeks the pool should remain active
+     * @param multisigWallet Associated multisig wallet for this pool
+     */
+    function createPool(
+        address labelToken,
+        uint256 goal,
+        uint256 durationWeeks,
+        address multisigWallet
+    ) external nonReentrant whenNotPaused returns (uint256) {
+        require(labelToken != address(0), "Invalid label token");
+        require(multisigWallet != address(0), "Invalid multisig wallet");
+        require(goal >= MIN_GOAL && goal <= MAX_GOAL, "Invalid goal amount");
+        require(goal % GOAL_INCREMENT == 0, "Goal must be in 50B increments");
+        require(durationWeeks >= MIN_WEEKS && durationWeeks <= MAX_WEEKS, "Invalid duration");
+        
+        uint256 poolId = nextPoolId++;
+        PoolStructs.Pool storage newPool = pools[poolId];
+        
+        newPool.labelToken = labelToken;
+        newPool.goal = goal;
+        newPool.currentAmount = 0;
+        newPool.deadline = block.timestamp + (durationWeeks * WEEK_IN_SECONDS);
+        newPool.isActive = true;
+        newPool.goalMet = false;
+        newPool.hasWon = false;
+        newPool.isComplete = false;
+        newPool.multisigWallet = multisigWallet;
+        newPool.totalContributors = 0;
+        newPool.rewardAmount = 0;
+        newPool.rewardsDistributed = false;
+        
+        emit PoolCreated(poolId, msg.sender, labelToken, goal, newPool.deadline, multisigWallet);
+        
+        return poolId;
+    }
+    
+    /**
+     * @dev Contribute PNDC tokens to a pool
+     * @param poolId The ID of the pool to contribute to
+     * @param amount Amount of PNDC tokens to contribute
+     */
+    function contributeToPool(uint256 poolId, uint256 amount) 
+        external 
+        nonReentrant 
+        whenNotPaused 
+        validPool(poolId) 
+        poolActive(poolId) 
+    {
+        require(amount > 0, "Amount must be greater than 0");
+        
+        PoolStructs.Pool storage pool = pools[poolId];
+        
+        // Check if pool is accepting contributions (not during active auction if goal met)
+        if (pool.goalMet) {
+            // Pool can only accept contributions if no auction is active
+            require(!_isAuctionActive(), "Pool not accepting contributions during auction");
+        }
+        
+        require(pool.currentAmount + amount <= MAX_POOL_AMOUNT, "Pool would exceed maximum capacity");
+        
+        // Transfer tokens from user to multisig wallet
+        pndcToken.safeTransferFrom(msg.sender, pool.multisigWallet, amount);
+        
+        // Update pool state
+        pool.currentAmount += amount;
+        
+        // Track user contribution
+        if (pool.contributions[msg.sender] == 0) {
+            pool.contributors.push(msg.sender);
+            pool.totalContributors++;
+            userPools[msg.sender].push(poolId);
+        }
+        
+        pool.contributions[msg.sender] += amount;
+        userContributions[poolId][msg.sender].push(PoolStructs.UserContribution({
+            amount: amount,
+            timestamp: block.timestamp,
+            rewardsClaimed: false
+        }));
+        
+        // Check if goal is reached
+        if (!pool.goalMet && pool.currentAmount >= pool.goal) {
+            pool.goalMet = true;
+            emit GoalReached(poolId, pool.currentAmount);
+        }
+        
+        emit ContributionMade(poolId, msg.sender, amount, pool.currentAmount);
+    }
+    
+    /**
+     * @dev Get pool information
+     */
+    function getPoolInfo(uint256 poolId) 
+        external 
+        view 
+        override 
+        validPool(poolId) 
+        returns (
+            address labelToken,
+            uint256 goal,
+            uint256 currentAmount,
+            uint256 deadline,
+            bool isActive,
+            bool goalMet,
+            bool hasWon,
+            address multisigWallet
+        ) 
+    {
+        PoolStructs.Pool storage pool = pools[poolId];
+        return (
+            pool.labelToken,
+            pool.goal,
+            pool.currentAmount,
+            pool.deadline,
+            pool.isActive,
+            pool.goalMet,
+            pool.hasWon,
+            pool.multisigWallet
+        );
+    }
+    
+    /**
+     * @dev Check if pool is eligible for bidding
+     */
+    function isPoolEligibleForBid(uint256 poolId) external view override returns (bool) {
+        PoolStructs.Pool storage pool = pools[poolId];
+        return pool.isActive && 
+               pool.goalMet && 
+               !pool.hasWon && 
+               !pool.isComplete && 
+               block.timestamp <= pool.deadline;
+    }
+    
+    /**
+     * @dev Mark pool as auction winner (only auction manager can call)
+     */
+    function markPoolAsWinner(uint256 poolId) external override onlyAuctionManager {
+        PoolStructs.Pool storage pool = pools[poolId];
+        require(pool.goalMet, "Pool goal not met");
+        require(!pool.hasWon, "Pool already won");
+        
+        pool.hasWon = true;
+        pool.isActive = false; // Stop accepting new contributions
+        
+        emit PoolWon(poolId, pool.currentAmount);
+    }
+    
+    /**
+     * @dev Distribute rewards to pool (only reward distributor can call)
+     */
+    function distributeRewards(uint256 poolId, address rewardToken, uint256 amount) 
+        external 
+        override 
+        onlyRewardDistributor 
+    {
+        PoolStructs.Pool storage pool = pools[poolId];
+        require(pool.hasWon, "Pool has not won an auction");
+        require(!pool.rewardsDistributed, "Rewards already distributed");
+        
+        pool.rewardToken = rewardToken;
+        pool.rewardAmount = amount;
+        
+        emit RewardsReceived(poolId, rewardToken, amount);
+        
+        _distributeRewardsToUsers(poolId);
+    }
+    
+    /**
+     * @dev Internal function to distribute rewards to users
+     */
+    function _distributeRewardsToUsers(uint256 poolId) internal {
+        PoolStructs.Pool storage pool = pools[poolId];
+        require(pool.rewardAmount > 0, "No rewards to distribute");
+        
+        // Calculate system fee (3%)
+        uint256 systemFee = (pool.rewardAmount * SYSTEM_FEE_PERCENTAGE) / 100;
+        uint256 userRewards = pool.rewardAmount - systemFee;
+        
+        // Transfer system fee to owner
+        IERC20(pool.rewardToken).safeTransfer(owner(), systemFee);
+        
+        // Distribute rewards proportionally
+        for (uint256 i = 0; i < pool.contributors.length; i++) {
+            address contributor = pool.contributors[i];
+            uint256 userContribution = pool.contributions[contributor];
+            uint256 userReward = (userRewards * userContribution) / pool.currentAmount;
+            
+            if (userReward > 0) {
+                IERC20(pool.rewardToken).safeTransfer(contributor, userReward);
+                emit RewardsDistributed(poolId, contributor, userReward);
+            }
+        }
+        
+        pool.rewardsDistributed = true;
+        pool.isComplete = true;
+    }
+    
+    /**
+     * @dev Return tokens to users when pool expires without winning
+     */
+    function returnTokensOnExpiry(uint256 poolId) external nonReentrant {
+        PoolStructs.Pool storage pool = pools[poolId];
+        require(block.timestamp > pool.deadline, "Pool has not expired");
+        require(!pool.hasWon, "Pool has won, cannot return tokens");
+        require(!pool.isComplete, "Pool already processed");
+        
+        // Return tokens to all contributors
+        for (uint256 i = 0; i < pool.contributors.length; i++) {
+            address contributor = pool.contributors[i];
+            uint256 contributionAmount = pool.contributions[contributor];
+            
+            if (contributionAmount > 0) {
+                // Transfer tokens back from multisig to contributor
+                // This would require multisig approval in practice
+                emit TokensReturned(poolId, contributor, contributionAmount);
+            }
+        }
+        
+        pool.isActive = false;
+        pool.isComplete = true;
+        
+        emit PoolExpired(poolId);
+    }
+    
+    /**
+     * @dev Get user's contribution to a specific pool
+     */
+    function getUserContribution(uint256 poolId, address user) external view returns (uint256) {
+        return pools[poolId].contributions[user];
+    }
+    
+    /**
+     * @dev Get all pools a user has participated in
+     */
+    function getUserPools(address user) external view returns (uint256[] memory) {
+        return userPools[user];
+    }
+    
+    /**
+     * @dev Get eligible pools for bidding (sorted by amount descending)
+     */
+    function getEligiblePools() external view returns (uint256[] memory) {
+        uint256[] memory eligiblePools = new uint256[](nextPoolId - 1);
+        uint256 count = 0;
+        
+        // Collect eligible pools
+        for (uint256 i = 1; i < nextPoolId; i++) {
+            if (this.isPoolEligibleForBid(i)) {
+                eligiblePools[count] = i;
+                count++;
+            }
+        }
+        
+        // Resize array to actual count
+        uint256[] memory result = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            result[i] = eligiblePools[i];
+        }
+        
+        // Sort by pool amount (descending) - largest pools bid first
+        _sortPoolsByAmount(result);
+        
+        return result;
+    }
+    
+    /**
+     * @dev Sort pools by amount (descending)
+     */
+    function _sortPoolsByAmount(uint256[] memory poolIds) internal view {
+        for (uint256 i = 0; i < poolIds.length - 1; i++) {
+            for (uint256 j = i + 1; j < poolIds.length; j++) {
+                if (pools[poolIds[i]].currentAmount < pools[poolIds[j]].currentAmount) {
+                    uint256 temp = poolIds[i];
+                    poolIds[i] = poolIds[j];
+                    poolIds[j] = temp;
+                }
+            }
+        }
+    }
+    
+    /**
+     * @dev Check if an auction is currently active
+     */
+    function _isAuctionActive() internal view returns (bool) {
+        // This would integrate with the auction manager contract
+        // For now, returning false as placeholder
+        return false;
+    }
+    
+    /**
+     * @dev Emergency pause function
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpause function
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+    
+    /**
+     * @dev Update auction manager address
+     */
+    function updateAuctionManager(address _auctionManager) external onlyOwner {
+        auctionManager = _auctionManager;
+    }
+    
+    /**
+     * @dev Update reward distributor address
+     */
+    function updateRewardDistributor(address _rewardDistributor) external onlyOwner {
+        rewardDistributor = _rewardDistributor;
+    }
+    
+    /**
+     * @dev Update bridge contract address
+     */
+    function updateBridgeContract(address _bridgeContract) external onlyOwner {
+        bridgeContract = _bridgeContract;
+    }
+}
+
+/**
+ * @title AuctionManager
+ * @dev Manages the auction process and bidding logic
+ */
+contract AuctionManager is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    
+    IPNDCPoolManager public poolManager;
+    IERC20 public pndcToken;
+    
+    PoolStructs.AuctionState public currentAuction;
+    
+    event AuctionStarted(uint256 indexed auctionId, uint256 startTime, uint256[] eligiblePools);
+    event BidPlaced(uint256 indexed auctionId, uint256 indexed poolId, uint256 amount);
+    event AuctionEnded(uint256 indexed auctionId, uint256 winningPool, uint256 winningAmount);
+    
+    constructor(address _poolManager, address _pndcToken) {
+        poolManager = IPNDCPoolManager(_poolManager);
+        pndcToken = IERC20(_pndcToken);
+    }
+    
+    /**
+     * @dev Start a new auction
+     */
+    function startAuction(uint256 duration) external onlyOwner {
+        require(!currentAuction.isActive, "Auction already active");
+        
+        // Get eligible pools from pool manager
+        uint256[] memory eligiblePools = PNDCPoolManager(address(poolManager)).getEligiblePools();
+        require(eligiblePools.length > 0, "No eligible pools");
+        
+        currentAuction.isActive = true;
+        currentAuction.startTime = block.timestamp;
+        currentAuction.endTime = block.timestamp + duration;
+        currentAuction.eligiblePools = eligiblePools;
+        currentAuction.hasWinner = false;
+        currentAuction.winningPool = 0;
+        
+        emit AuctionStarted(block.timestamp, block.timestamp, eligiblePools);
+    }
+    
+    /**
+     * @dev Place bid for the highest eligible pool
+     */
+    function placeBid() external nonReentrant {
+        require(currentAuction.isActive, "No active auction");
+        require(block.timestamp <= currentAuction.endTime, "Auction has ended");
+        require(!currentAuction.hasWinner, "Auction already has winner");
+        
+        // Get the largest eligible pool
+        uint256 winningPoolId = currentAuction.eligiblePools[0];
+        
+        // Mark pool as winner
+        poolManager.markPoolAsWinner(winningPoolId);
+        
+        // Update auction state
+        currentAuction.hasWinner = true;
+        currentAuction.winningPool = winningPoolId;
+        currentAuction.isActive = false;
+        
+        // Get pool info for bid amount
+        (, , uint256 bidAmount, , , , , ) = poolManager.getPoolInfo(winningPoolId);
+        
+        emit BidPlaced(currentAuction.startTime, winningPoolId, bidAmount);
+        emit AuctionEnded(currentAuction.startTime, winningPoolId, bidAmount);
+    }
+    
+    /**
+     * @dev End auction manually
+     */
+    function endAuction() external onlyOwner {
+        require(currentAuction.isActive, "No active auction");
+        currentAuction.isActive = false;
+        
+        emit AuctionEnded(currentAuction.startTime, currentAuction.winningPool, 0);
+    }
+    
+    /**
+     * @dev Get current auction state
+     */
+    function getCurrentAuction() external view returns (
+        bool isActive,
+        uint256 startTime,
+        uint256 endTime,
+        uint256[] memory eligiblePools,
+        uint256 winningPool,
+        bool hasWinner
+    ) {
+        return (
+            currentAuction.isActive,
+            currentAuction.startTime,
+            currentAuction.endTime,
+            currentAuction.eligiblePools,
+            currentAuction.winningPool,
+            currentAuction.hasWinner
+        );
+    }
+}
+
+/**
+ * @title RewardDistributor
+ * @dev Handles reward distribution and cross-chain bridging
+ */
+contract RewardDistributor is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    
+    IPNDCPoolManager public poolManager;
+    address public bridgeContract;
+    
+    mapping(address => bool) public supportedRewardTokens;
+    mapping(uint256 => bool) public rewardsProcessed;
+    
+    event RewardTokenAdded(address indexed token);
+    event RewardTokenRemoved(address indexed token);
+    event RewardsProcessed(uint256 indexed poolId, address rewardToken, uint256 amount);
+    event SPLTokensBridged(address indexed splToken, uint256 amount, uint256 ethReceived);
+    
+    constructor(address _poolManager, address _bridgeContract) {
+        poolManager = IPNDCPoolManager(_poolManager);
+        bridgeContract = _bridgeContract;
+    }
+    
+    /**
+     * @dev Add supported reward token
+     */
+    function addSupportedRewardToken(address token) external onlyOwner {
+        supportedRewardTokens[token] = true;
+        emit RewardTokenAdded(token);
+    }
+    
+    /**
+     * @dev Remove supported reward token
+     */
+    function removeSupportedRewardToken(address token) external onlyOwner {
+        supportedRewardTokens[token] = false;
+        emit RewardTokenRemoved(token);
+    }
+    
+    /**
+     * @dev Process rewards for a winning pool
+     */
+    function processRewards(
+        uint256 poolId,
+        address rewardToken,
+        uint256 amount,
+        bool isSPLToken
+    ) external nonReentrant onlyOwner {
+        require(!rewardsProcessed[poolId], "Rewards already processed");
+        require(supportedRewardTokens[rewardToken], "Unsupported reward token");
+        
+        if (isSPLToken) {
+            // Bridge SPL tokens to ETH
+            uint256 ethAmount = _bridgeAndSwapSPLToETH(rewardToken, amount);
+            poolManager.distributeRewards(poolId, address(0), ethAmount); // address(0) represents ETH
+            
+            emit SPLTokensBridged(rewardToken, amount, ethAmount);
+        } else {
+            // Direct ERC-20 distribution
+            IERC20(rewardToken).safeTransfer(address(poolManager), amount);
+            poolManager.distributeRewards(poolId, rewardToken, amount);
+        }
+        
+        rewardsProcessed[poolId] = true;
+        emit RewardsProcessed(poolId, rewardToken, amount);
+    }
+    
+    /**
+     * @dev Bridge SPL tokens and swap to ETH
+     */
+    function _bridgeAndSwapSPLToETH(address splToken, uint256 amount) internal returns (uint256) {
+        // This would integrate with your bridge contract
+        // Placeholder implementation
+        require(bridgeContract != address(0), "Bridge contract not set");
+        
+        // In a real implementation, this would:
+        // 1. Call bridge contract to convert SPL to ERC-20
+        // 2. Swap ERC-20 to ETH via DEX
+        // 3. Return ETH amount
+        
+        // For now, returning amount as placeholder
+        return amount;
+    }
+    
+    /**
+     * @dev Update bridge contract
+     */
+    function updateBridgeContract(address _bridgeContract) external onlyOwner {
+        bridgeContract = _bridgeContract;
+    }
+    
+    /**
+     * @dev Emergency withdrawal function
+     */
+    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
+        if (token == address(0)) {
+            payable(owner()).transfer(amount);
+        } else {
+            IERC20(token).safeTransfer(owner(), amount);
+        }
+    }
+    
+    // Allow contract to receive ETH
+    receive() external payable {}
+}
+
+/**
+ * @title MultisigWalletManager
+ * @dev Manages multisig wallets for each pool
+ */
+contract MultisigWalletManager is Ownable {
+    
+    struct MultisigWallet {
+        address walletAddress;
+        address[] owners;
+        uint256 threshold;
+        bool isActive;
+    }
+    
+    mapping(uint256 => MultisigWallet) public poolWallets;
+    mapping(address => bool) public authorizedWallets;
+    
+    event MultisigWalletCreated(uint256 indexed poolId, address walletAddress, address[] owners, uint256 threshold);
+    event MultisigWalletUpdated(uint256 indexed poolId, address newWalletAddress);
+    
+    /**
+     * @dev Create a multisig wallet for a pool
+     */
+    function createMultisigWallet(
+        uint256 poolId,
+        address walletAddress,
+        address[] memory owners,
+        uint256 threshold
+    ) external onlyOwner {
+        require(owners.length >= threshold, "Invalid threshold");
+        require(threshold > 0, "Threshold must be greater than 0");
+        
+        MultisigWallet storage wallet = poolWallets[poolId];
+        wallet.walletAddress = walletAddress;
+        wallet.owners = owners;
+        wallet.threshold = threshold;
+        wallet.isActive = true;
+        
+        authorizedWallets[walletAddress] = true;
+        
+        emit MultisigWalletCreated(poolId, walletAddress, owners, threshold);
+    }
+    
+    /**
+     * @dev Update multisig wallet for a pool
+     */
+    function updateMultisigWallet(uint256 poolId, address newWalletAddress) external onlyOwner {
+        require(poolWallets[poolId].walletAddress != address(0), "Wallet does not exist");
+        
+        // Deauthorize old wallet
+        authorizedWallets[poolWallets[poolId].walletAddress] = false;
+        
+        // Authorize new wallet
+        poolWallets[poolId].walletAddress = newWalletAddress;
+        authorizedWallets[newWalletAddress] = true;
+        
+        emit MultisigWalletUpdated(poolId, newWalletAddress);
+    }
+    
+    /**
+     * @dev Check if wallet is authorized
+     */
+    function isAuthorizedWallet(address wallet) external view returns (bool) {
+        return authorizedWallets[wallet];
+    }
+}
+
+/**
+ * @title BridgeContract
+ * @dev Placeholder for cross-chain bridge functionality
+ */
+contract BridgeContract is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    
+    mapping(address => bool) public supportedTokens;
+    mapping(bytes32 => bool) public processedTransactions;
+    
+    event TokensBridged(address indexed token, uint256 amount, bytes32 txHash);
+    event TokensReceived(address indexed token, uint256 amount, bytes32 txHash);
+    
+    /**
+     * @dev Bridge tokens from SPL to ERC-20
+     */
+    function bridgeFromSPL(
+        address splToken,
+        address erc20Token,
+        uint256 amount,
+        bytes32 txHash
+    ) external onlyOwner nonReentrant {
+        require(supportedTokens[erc20Token], "Token not supported");
+        require(!processedTransactions[txHash], "Transaction already processed");
+        
+        processedTransactions[txHash] = true;
+        
+        // Mint or transfer ERC-20 tokens
+        IERC20(erc20Token).safeTransfer(msg.sender, amount);
+        
+        emit TokensReceived(erc20Token, amount, txHash);
+    }
+    
+    /**
+     * @dev Bridge tokens from ERC-20 to SPL
+     */
+    function bridgeToSPL(
+        address erc20Token,
+        address splToken,
+        uint256 amount
+    ) external nonReentrant {
+        require(supportedTokens[erc20Token], "Token not supported");
+        
+        // Burn or lock ERC-20 tokens
+        IERC20(erc20Token).safeTransferFrom(msg.sender, address(this), amount);
+        
+        bytes32 txHash = keccak256(abi.encodePacked(block.timestamp, msg.sender, amount));
+        
+        emit TokensBridged(erc20Token, amount, txHash);
+    }
+    
+    /**
+     * @dev Add supported token
+     */
+    function addSupportedToken(address token) external onlyOwner {
+        supportedTokens[token] = true;
+    }
+    
+    /**
+     * @dev Remove supported token
+     */
+    function removeSupportedToken(address token) external onlyOwner {
+        supportedTokens[token] = false;
+    }
+    
+    /**
+     * @dev Check if token is supported
+     */
+    function isTokenSupported(address token) external view returns (bool) {
+        return supportedTokens[token];
+    }
+    
+    /**
+     * @dev Emergency withdrawal
+     */
+    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
+        IERC20(token).safeTransfer(owner(), amount);
+    }
+}
+
+/**
+ * @title PoolFactory
+ * @dev Factory contract for creating new pools with proper validation
+ */
+contract PoolFactory is Ownable {
+    
+    IPNDCPoolManager public poolManager;
+    MultisigWalletManager public walletManager;
+    
+    // Pool creation fees
+    uint256 public poolCreationFee;
+    mapping(address => bool) public authorizedCreators;
+    
+    event PoolCreated(
+        uint256 indexed poolId,
+        address indexed creator,
+        address indexed labelToken,
+        uint256 goal,
+        uint256 deadline
+    );
+    
+    event PoolCreationFeeUpdated(uint256 newFee);
+    event CreatorAuthorized(address indexed creator);
+    event CreatorRevoked(address indexed creator);
+    
+    modifier onlyAuthorized() {
+        require(authorizedCreators[msg.sender] || msg.sender == owner(), "Not authorized to create pools");
+        _;
+    }
+    
+    constructor(
+        address _poolManager,
+        address _walletManager,
+        uint256 _poolCreationFee
+    ) {
+        poolManager = IPNDCPoolManager(_poolManager);
+        walletManager = MultisigWalletManager(_walletManager);
+        poolCreationFee = _poolCreationFee;
+    }
+    
+    /**
+     * @dev Create a new pool with multisig wallet
+     */
+    function createPoolWithMultisig(
+        address labelToken,
+        uint256 goal,
+        uint256 durationWeeks,
+        address[] memory multisigOwners,
+        uint256 multisigThreshold,
+        address multisigWallet
+    ) external payable onlyAuthorized {
+        require(msg.value >= poolCreationFee, "Insufficient fee");
+        
+        // Create the pool
+        uint256 poolId = poolManager.createPool(
+            labelToken,
+            goal,
+            durationWeeks,
+            multisigWallet
+        );
+        
+        // Register the multisig wallet
+        walletManager.createMultisigWallet(
+            poolId,
+            multisigWallet,
+            multisigOwners,
+            multisigThreshold
+        );
+        
+        emit PoolCreated(poolId, msg.sender, labelToken, goal, block.timestamp + (durationWeeks * 604800));
+        
+        // Refund excess fee
+        if (msg.value > poolCreationFee) {
+            payable(msg.sender).transfer(msg.value - poolCreationFee);
+        }
+    }
+    
+    /**
+     * @dev Authorize address to create pools
+     */
+    function authorizeCreator(address creator) external onlyOwner {
+        authorizedCreators[creator] = true;
+        emit CreatorAuthorized(creator);
+    }
+    
+    /**
+     * @dev Revoke pool creation authorization
+     */
+    function revokeCreator(address creator) external onlyOwner {
+        authorizedCreators[creator] = false;
+        emit CreatorRevoked(creator);
+    }
+    
+    /**
+     * @dev Update pool creation fee
+     */
+    function updatePoolCreationFee(uint256 newFee) external onlyOwner {
+        poolCreationFee = newFee;
+        emit PoolCreationFeeUpdated(newFee);
+    }
+    
+    /**
+     * @dev Withdraw collected fees
+     */
+    function withdrawFees() external onlyOwner {
+        payable(owner()).transfer(address(this).balance);
+    }
+}
+
+/**
+ * @title PoolAnalytics
+ * @dev Contract for tracking pool analytics and statistics
+ */
+contract PoolAnalytics is Ownable {
+    
+    IPNDCPoolManager public poolManager;
+    
+    struct PoolStats {
+        uint256 totalContributions;
+        uint256 averageContribution;
+        uint256 uniqueContributors;
+        uint256 timeToGoal;
+        bool goalReached;
+        uint256 finalAmount;
+    }
+    
+    struct GlobalStats {
+        uint256 totalPools;
+        uint256 totalValueLocked;
+        uint256 successfulPools;
+        uint256 expiredPools;
+        uint256 totalRewardsDistributed;
+        uint256 totalUsers;
+    }
+    
+    mapping(uint256 => PoolStats) public poolStats;
+    mapping(address => uint256) public userTotalContributions;
+    mapping(address => uint256) public userPoolCount;
+    
+    GlobalStats public globalStats;
+    
+    event StatsUpdated(uint256 indexed poolId, uint256 newContribution);
+    event GlobalStatsUpdated(uint256 totalPools, uint256 totalValueLocked);
+    
+    constructor(address _poolManager) {
+        poolManager = IPNDCPoolManager(_poolManager);
+    }
+    
+    /**
+     * @dev Update stats when contribution is made
+     */
+    function updateContributionStats(
+        uint256 poolId,
+        address contributor,
+        uint256 amount
+    ) external {
+        require(msg.sender == address(poolManager), "Only pool manager can update stats");
+        
+        PoolStats storage stats = poolStats[poolId];
+        stats.totalContributions += amount;
+        
+        // Update user stats
+        if (userTotalContributions[contributor] == 0) {
+            globalStats.totalUsers++;
+        }
+        userTotalContributions[contributor] += amount;
+        
+        // Update global stats
+        globalStats.totalValueLocked += amount;
+        
+        emit StatsUpdated(poolId, amount);
+    }
+    
+    /**
+     * @dev Update stats when pool goal is reached
+     */
+    function updateGoalReachedStats(uint256 poolId) external {
+        require(msg.sender == address(poolManager), "Only pool manager can update stats");
+        
+        PoolStats storage stats = poolStats[poolId];
+        stats.goalReached = true;
+        stats.timeToGoal = block.timestamp;
+        
+        globalStats.successfulPools++;
+    }
+    
+    /**
+     * @dev Update stats when pool expires
+     */
+    function updateExpiredStats(uint256 poolId) external {
+        require(msg.sender == address(poolManager), "Only pool manager can update stats");
+        
+        globalStats.expiredPools++;
+    }
+    
+    /**
+     * @dev Get pool statistics
+     */
+    function getPoolStats(uint256 poolId) external view returns (PoolStats memory) {
+        return poolStats[poolId];
+    }
+    
+    /**
+     * @dev Get global statistics
+     */
+    function getGlobalStats() external view returns (GlobalStats memory) {
+        return globalStats;
+    }
+    
+    /**
+     * @dev Get user statistics
+     */
+    function getUserStats(address user) external view returns (uint256 totalContributions, uint256 poolCount) {
+        return (userTotalContributions[user], userPoolCount[user]);
+    }
+}
+
+/**
+ * @title EmergencyManager
+ * @dev Handles emergency situations and system maintenance
+ */
+contract EmergencyManager is Ownable {
+    
+    IPNDCPoolManager public poolManager;
+    AuctionManager public auctionManager;
+    RewardDistributor public rewardDistributor;
+    
+    bool public systemPaused;
+    bool public emergencyMode;
+    
+    mapping(address => bool) public emergencyOperators;
+    
+    event SystemPaused(address indexed operator);
+    event SystemUnpaused(address indexed operator);
+    event EmergencyModeActivated(address indexed operator);
+    event EmergencyModeDeactivated(address indexed operator);
+    event EmergencyOperatorAdded(address indexed operator);
+    event EmergencyOperatorRemoved(address indexed operator);
+    
+    modifier onlyEmergencyOperator() {
+        require(emergencyOperators[msg.sender] || msg.sender == owner(), "Not authorized");
+        _;
+    }
+    
+    modifier notInEmergencyMode() {
+        require(!emergencyMode, "System in emergency mode");
+        _;
+    }
+    
+    constructor(
+        address _poolManager,
+        address _auctionManager,
+        address _rewardDistributor
+    ) {
+        poolManager = IPNDCPoolManager(_poolManager);
+        auctionManager = AuctionManager(_auctionManager);
+        rewardDistributor = RewardDistributor(_rewardDistributor);
+        
+        emergencyOperators[msg.sender] = true;
+    }
+    
+    /**
+     * @dev Pause entire system
+     */
+    function pauseSystem() external onlyEmergencyOperator {
+        systemPaused = true;
+        
+        // Pause all contracts
+        PNDCPoolManager(address(poolManager)).pause();
+        
+        emit SystemPaused(msg.sender);
+    }
+    
+    /**
+     * @dev Unpause system
+     */
+    function unpauseSystem() external onlyEmergencyOperator {
+        systemPaused = false;
+        
+        // Unpause all contracts
+        PNDCPoolManager(address(poolManager)).unpause();
+        
+        emit SystemUnpaused(msg.sender);
+    }
+    
+    /**
+     * @dev Activate emergency mode
+     */
+    function activateEmergencyMode() external onlyEmergencyOperator {
+        emergencyMode = true;
+        pauseSystem();
+        
+        emit EmergencyModeActivated(msg.sender);
+    }
+    
+    /**
+     * @dev Deactivate emergency mode
+     */
+    function deactivateEmergencyMode() external onlyOwner {
+        emergencyMode = false;
+        unpauseSystem();
+        
+        emit EmergencyModeDeactivated(msg.sender);
+    }
+    
+    /**
+     * @dev Add emergency operator
+     */
+    function addEmergencyOperator(address operator) external onlyOwner {
+        emergencyOperators[operator] = true;
+        emit EmergencyOperatorAdded(operator);
+    }
+    
+    /**
+     * @dev Remove emergency operator
+     */
+    function removeEmergencyOperator(address operator) external onlyOwner {
+        emergencyOperators[operator] = false;
+        emit EmergencyOperatorRemoved(operator);
+    }
+    
+    /**
+     * @dev Emergency withdrawal from any contract
+     */
+    function emergencyWithdraw(
+        address contractAddress,
+        address token,
+        uint256 amount,
+        address recipient
+    ) external onlyOwner {
+        require(emergencyMode, "Emergency mode not active");
+        
+        // This would call emergency withdrawal functions on target contracts
+        // Implementation depends on specific contract interfaces
+    }
+}
+
+/**
+ * @title SystemGovernance
+ * @dev Handles system governance and parameter updates
+ */
+contract SystemGovernance is Ownable {
+    
+    struct Proposal {
+        uint256 id;
+        string description;
+        address target;
+        bytes data;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 forVotes;
+        uint256 againstVotes;
+        bool executed;
+        mapping(address => bool) hasVoted;
+    }
+    
+    mapping(uint256 => Proposal) public proposals;
+    mapping(address => uint256) public votingPower;
+    
+    uint256 public nextProposalId;
+    uint256 public votingDuration = 7 days;
+    uint256 public proposalThreshold = 1000000 * 10**18; // 1M PNDC to create proposal
+    uint256 public quorumThreshold = 50; // 50% participation required
+    
+    IERC20 public governanceToken;
+    
+    event ProposalCreated(
+        uint256 indexed proposalId,
+        address indexed proposer,
+        string description,
+        uint256 startTime,
+        uint256 endTime
+    );
+    
+    event VoteCast(
+        uint256 indexed proposalId,
+        address indexed voter,
+        bool support,
+        uint256 votes
+    );
+    
+    event ProposalExecuted(uint256 indexed proposalId);
+    
+    constructor(address _governanceToken) {
+        governanceToken = IERC20(_governanceToken);
+        nextProposalId = 1;
+    }
+    
+    /**
+     * @dev Create a new proposal
+     */
+    function createProposal(
+        string memory description,
+        address target,
+        bytes memory data
+    ) external returns (uint256) {
+        require(
+            governanceToken.balanceOf(msg.sender) >= proposalThreshold,
+            "Insufficient tokens to create proposal"
+        );
+        
+        uint256 proposalId = nextProposalId++;
+        Proposal storage proposal = proposals[proposalId];
+        
+        proposal.id = proposalId;
+        proposal.description = description;
+        proposal.target = target;
+        proposal.data = data;
+        proposal.startTime = block.timestamp;
+        proposal.endTime = block.timestamp + votingDuration;
+        proposal.forVotes = 0;
+        proposal.againstVotes = 0;
+        proposal.executed = false;
+        
+        emit ProposalCreated(
+            proposalId,
+            msg.sender,
+            description,
+            proposal.startTime,
+            proposal.endTime
+        );
+        
+        return proposalId;
+    }
+    
+    /**
+     * @dev Cast vote on a proposal
+     */
+    function castVote(uint256 proposalId, bool support) external {
+        Proposal storage proposal = proposals[proposalId];
+        
+        require(block.timestamp >= proposal.startTime, "Voting not started");
+        require(block.timestamp <= proposal.endTime, "Voting ended");
+        require(!proposal.hasVoted[msg.sender], "Already voted");
+        
+        uint256 votes = governanceToken.balanceOf(msg.sender);
+        require(votes > 0, "No voting power");
+        
+        proposal.hasVoted[msg.sender] = true;
+        
+        if (support) {
+            proposal.forVotes += votes;
+        } else {
+            proposal.againstVotes += votes;
+        }
+        
+        emit VoteCast(proposalId, msg.sender, support, votes);
+    }
+    
+    /**
+     * @dev Execute a successful proposal
+     */
+    function executeProposal(uint256 proposalId) external {
+        Proposal storage proposal = proposals[proposalId];
+        
+        require(block.timestamp > proposal.endTime, "Voting still active");
+        require(!proposal.executed, "Already executed");
+        require(proposal.forVotes > proposal.againstVotes, "Proposal failed");
+        
+        uint256 totalVotes = proposal.forVotes + proposal.againstVotes;
+        uint256 totalSupply = governanceToken.totalSupply();
+        
+        require(
+            (totalVotes * 100) / totalSupply >= quorumThreshold,
+            "Quorum not reached"
+        );
+        
+        proposal.executed = true;
+        
+        // Execute the proposal
+        (bool success, ) = proposal.target.call(proposal.data);
+        require(success, "Proposal execution failed");
+        
+        emit ProposalExecuted(proposalId);
+    }
+    
+    /**
+     * @dev Get proposal details
+     */
+    function getProposal(uint256 proposalId) external view returns (
+        uint256 id,
+        string memory description,
+        address target,
+        uint256 startTime,
+        uint256 endTime,
+        uint256 forVotes,
+        uint256 againstVotes,
+        bool executed
+    ) {
+        Proposal storage proposal = proposals[proposalId];
+        return (
+            proposal.id,
+            proposal.description,
+            proposal.target,
+            proposal.startTime,
+            proposal.endTime,
+            proposal.forVotes,
+            proposal.againstVotes,
+            proposal.executed
+        );
+    }
+    
+    /**
+     * @dev Update voting parameters
+     */
+    function updateVotingParameters(
+        uint256 _votingDuration,
+        uint256 _proposalThreshold,
+        uint256 _quorumThreshold
+    ) external onlyOwner {
+        votingDuration = _votingDuration;
+        proposalThreshold = _proposalThreshold;
+        quorumThreshold = _quorumThreshold;
+    }
+}
