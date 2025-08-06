@@ -1,0 +1,38 @@
+/**
+ * @title PoolStructs
+ * @dev Library containing all data structures used across contracts
+ */
+library PoolStructs {
+    struct Pool {
+        address labelToken;         // SPL or ERC-20 token address this pool represents
+        uint256 goal;              // Target amount (50B to 1T PNDC)
+        uint256 currentAmount;     // Current pooled amount
+        uint256 deadline;          // Timestamp when pool expires
+        bool isActive;             // Whether pool is accepting contributions
+        bool goalMet;              // Whether goal has been reached
+        bool hasWon;               // Whether pool won an auction
+        bool isComplete;           // Whether pool is permanently closed
+        address multisigWallet;    // Associated multisig wallet
+        mapping(address => uint256) contributions; // User contributions
+        address[] contributors;    // List of all contributors
+        uint256 totalContributors; // Count of unique contributors
+        uint256 rewardAmount;      // Total rewards received
+        address rewardToken;       // Token used for rewards
+        bool rewardsDistributed;   // Whether rewards have been distributed
+    }
+    
+    struct UserContribution {
+        uint256 amount;
+        uint256 timestamp;
+        bool rewardsClaimed;
+    }
+    
+    struct AuctionState {
+        bool isActive;
+        uint256 startTime;
+        uint256 endTime;
+        uint256[] eligiblePools;
+        uint256 winningPool;
+        bool hasWinner;
+    }
+}
