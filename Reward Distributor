@@ -1,0 +1,105 @@
+/**
+ * @title RewardDistributor
+ * @dev Handles reward distribution and cross-chain bridging
+ */
+contract RewardDistributor is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    
+    IPNDCPoolManager public poolManager;
+    address public bridgeContract;
+    
+    mapping(address => bool) public supportedRewardTokens;
+    mapping(uint256 => bool) public rewardsProcessed;
+    
+    event RewardTokenAdded(address indexed token);
+    event RewardTokenRemoved(address indexed token);
+    event RewardsProcessed(uint256 indexed poolId, address rewardToken, uint256 amount);
+    event SPLTokensBridged(address indexed splToken, uint256 amount, uint256 ethReceived);
+    
+    constructor(address _poolManager, address _bridgeContract) {
+        poolManager = IPNDCPoolManager(_poolManager);
+        bridgeContract = _bridgeContract;
+    }
+    
+    /**
+     * @dev Add supported reward token
+     */
+    function addSupportedRewardToken(address token) external onlyOwner {
+        supportedRewardTokens[token] = true;
+        emit RewardTokenAdded(token);
+    }
+    
+    /**
+     * @dev Remove supported reward token
+     */
+    function removeSupportedRewardToken(address token) external onlyOwner {
+        supportedRewardTokens[token] = false;
+        emit RewardTokenRemoved(token);
+    }
+    
+    /**
+     * @dev Process rewards for a winning pool
+     */
+    function processRewards(
+        uint256 poolId,
+        address rewardToken,
+        uint256 amount,
+        bool isSPLToken
+    ) external nonReentrant onlyOwner {
+        require(!rewardsProcessed[poolId], "Rewards already processed");
+        require(supportedRewardTokens[rewardToken], "Unsupported reward token");
+        
+        if (isSPLToken) {
+            // Bridge SPL tokens to ETH
+            uint256 ethAmount = _bridgeAndSwapSPLToETH(rewardToken, amount);
+            poolManager.distributeRewards(poolId, address(0), ethAmount); // address(0) represents ETH
+            
+            emit SPLTokensBridged(rewardToken, amount, ethAmount);
+        } else {
+            // Direct ERC-20 distribution
+            IERC20(rewardToken).safeTransfer(address(poolManager), amount);
+            poolManager.distributeRewards(poolId, rewardToken, amount);
+        }
+        
+        rewardsProcessed[poolId] = true;
+        emit RewardsProcessed(poolId, rewardToken, amount);
+    }
+    
+    /**
+     * @dev Bridge SPL tokens and swap to ETH
+     */
+    function _bridgeAndSwapSPLToETH(address splToken, uint256 amount) internal returns (uint256) {
+        // This would integrate with your bridge contract
+        // Placeholder implementation
+        require(bridgeContract != address(0), "Bridge contract not set");
+        
+        // In a real implementation, this would:
+        // 1. Call bridge contract to convert SPL to ERC-20
+        // 2. Swap ERC-20 to ETH via DEX
+        // 3. Return ETH amount
+        
+        // For now, returning amount as placeholder
+        return amount;
+    }
+    
+    /**
+     * @dev Update bridge contract
+     */
+    function updateBridgeContract(address _bridgeContract) external onlyOwner {
+        bridgeContract = _bridgeContract;
+    }
+    
+    /**
+     * @dev Emergency withdrawal function
+     */
+    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
+        if (token == address(0)) {
+            payable(owner()).transfer(amount);
+        } else {
+            IERC20(token).safeTransfer(owner(), amount);
+        }
+    }
+    
+    // Allow contract to receive ETH
+    receive() external payable {}
+}
