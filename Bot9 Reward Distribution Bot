@@ -1,0 +1,85 @@
+// Reward Distribution Bot
+class RewardDistributionBot extends BaseBot {
+    constructor() {
+        super('RewardDistributionBot');
+        this.pendingRewards = new Map();
+    }
+    
+    async run() {
+        // Listen for pool wins
+        this.poolManager.on('PoolWon', async (poolId, bidAmount) => {
+            await this.handlePoolWin(poolId, bidAmount);
+        });
+        
+        while (this.isRunning) {
+            await this.checkPendingRewards();
+            await this.sleep(CONFIG.monitoring.checkInterval);
+        }
+    }
+    
+    async handlePoolWin(poolId, bidAmount) {
+        logger.info(`Pool ${poolId.toString()} won, preparing for reward distribution`);
+        
+        this.pendingRewards.set(poolId.toString(), {
+            poolId: poolId.toString(),
+            bidAmount: bidAmount.toString(),
+            timestamp: Date.now(),
+            status: 'pending'
+        });
+        
+        // Simulate waiting for external auction rewards
+        setTimeout(() => {
+            this.simulateRewardReceipt(poolId.toString());
+        }, 60000); // 1 minute delay
+    }
+    
+    async simulateRewardReceipt(poolId) {
+        // This would be replaced with actual reward detection logic
+        const rewardAmount = ethers.utils.parseEther('1000'); // 1000 ETH as example
+        const rewardToken = '0x0000000000000000000000000000000000000000'; // ETH
+        
+        await this.processReward(poolId, rewardToken, rewardAmount, false);
+    }
+    
+    async processReward(poolId, rewardToken, amount, isSPLToken) {
+        try {
+            logger.info(`Processing reward for pool ${poolId}: ${ethers.utils.formatEther(amount)} tokens`);
+            
+            const tx = await this.rewardDistributor.processRewards(
+                poolId,
+                rewardToken,
+                amount,
+                isSPLToken
+            );
+            
+            await tx.wait();
+            
+            logger.info(`Reward processed for pool ${poolId}: ${tx.hash}`);
+            
+            const pending = this.pendingRewards.get(poolId);
+            if (pending) {
+                pending.status = 'processed';
+                pending.txHash = tx.hash;
+            }
+            
+            await this.sendAlert(`Rewards distributed for pool ${poolId}`, 'info');
+            
+        } catch (error) {
+            logger.error(`Failed to process reward for pool ${poolId}: ${error.message}`);
+            await this.sendAlert(`Failed to process reward for pool ${poolId}: ${error.message}`, 'error');
+        }
+    }
+    
+    async checkPendingRewards() {
+        for (const [poolId, reward] of this.pendingRewards) {
+            if (reward.status === 'pending') {
+                const timeSinceWin = Date.now() - reward.timestamp;
+                
+                if (timeSinceWin > 300000) { // 5 minutes
+                    logger.warn(`Reward for pool ${poolId} still pending after 5 minutes`);
+                    await this.sendAlert(`Reward distribution delayed for pool ${poolId}`, 'warning');
+                }
+            }
+        }
+    }
+}
