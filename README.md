@@ -6,7 +6,13 @@ All code derived from AI
 
 [Smart contracts and management bots](https://claude.ai/share/7e052df8-cea0-4f62-ab18-392200d94115)
 
+[Updated conversation for changes in this branch](https://claude.ai/share/7e052df8-cea0-4f62-ab18-392200d94115)
+  - Includes new smart contracts and managemnt bots
+
 [UI/App](https://v0.dev/chat/pndc-token-pools-k1Lj2g0y32Y)
+
+## Updates:
+[key features for updates in this branch](https://github.com/RaptorCapture247/Pond0x-Dutch-Auction-Pooling-System/blob/multiple-auctions-with-unique-IDs-and-cross-chain-reward-distribution/README.md#key-features-for-updates-in-this-branch)
 
 ## System Overview
 The system allows users to:
