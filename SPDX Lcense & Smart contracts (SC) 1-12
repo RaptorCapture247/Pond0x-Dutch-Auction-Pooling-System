@@ -21,12 +21,13 @@ interface IPNDCPoolManager {
         bool isActive,
         bool goalMet,
         bool hasWon,
-        address multisigWallet
+        address multisigWallet,
+        uint256 winningAuctionId
     );
     
     function isPoolEligibleForBid(uint256 poolId) external view returns (bool);
-    function markPoolAsWinner(uint256 poolId) external;
-    function distributeRewards(uint256 poolId, address rewardToken, uint256 amount) external;
+    function markPoolAsWinner(uint256 poolId, uint256 auctionId) external;
+    function distributeRewards(uint256 poolId, uint256 auctionId, address rewardToken, uint256 amount, uint8 targetChain) external;
 }
 
 /**
@@ -43,34 +44,54 @@ library PoolStructs {
         bool goalMet;              // Whether goal has been reached
         bool hasWon;               // Whether pool won an auction
         bool isComplete;           // Whether pool is permanently closed
-        address multisigWallet;    // Associated multisig wallet
+        address ethMultisigWallet; // Associated ETH multisig wallet
+        address solMultisigWallet; // Associated SOL multisig wallet (encoded as address)
+        uint256 winningAuctionId;  // ID of auction this pool won
         mapping(address => uint256) contributions; // User contributions
         address[] contributors;    // List of all contributors
         uint256 totalContributors; // Count of unique contributors
-        uint256 rewardAmount;      // Total rewards received
+        mapping(uint256 => RewardInfo) auctionRewards; // Rewards per auction
+    }
+    
+    struct RewardInfo {
+        uint256 totalAmount;       // Total rewards received
         address rewardToken;       // Token used for rewards
-        bool rewardsDistributed;   // Whether rewards have been distributed
+        uint8 targetChain;         // 1 = Ethereum, 2 = Solana
+        bool distributed;          // Whether rewards have been distributed
+        mapping(address => uint256) userRewards; // Individual user rewards
     }
     
     struct UserContribution {
         uint256 amount;
         uint256 timestamp;
-        bool rewardsClaimed;
+        mapping(uint256 => bool) rewardsClaimed; // Per auction rewards claimed
     }
     
     struct AuctionState {
+        uint256 auctionId;         // Unique auction identifier
         bool isActive;
         uint256 startTime;
         uint256 endTime;
         uint256[] eligiblePools;
-        uint256 winningPool;
-        bool hasWinner;
+        uint256[] winningPools;    // Multiple pools can win different auctions
+        mapping(uint256 => bool) poolWon; // Track which pools won
+    }
+    
+    struct CrossChainMessage {
+        uint256 auctionId;
+        uint256 poolId;
+        address rewardToken;
+        uint256 amount;
+        uint8 sourceChain;
+        uint8 targetChain;
+        bytes32 messageHash;
+        bool processed;
     }
 }
 
 /**
  * @title PNDCPoolManager
- * @dev Main contract for managing PNDC token pools
+ * @dev Main contract for managing PNDC token pools with multi-auction support
  */
 contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable {
     using SafeERC20 for IERC20;
@@ -86,17 +107,23 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
     uint256 public constant WEEK_IN_SECONDS = 604800; // 1 week in seconds
     uint256 public constant SYSTEM_FEE_PERCENTAGE = 3; // 3% system fee
     
+    // Chain identifiers
+    uint8 public constant ETHEREUM_CHAIN = 1;
+    uint8 public constant SOLANA_CHAIN = 2;
+    
     // State variables
     IERC20 public pndcToken;
     address public auctionManager;
     address public rewardDistributor;
-    address public bridgeContract;
+    address public crossChainRewardManager;
     uint256 public nextPoolId;
     
     // Mappings
     mapping(uint256 => PoolStructs.Pool) public pools;
     mapping(address => uint256[]) public userPools; // User's participated pools
-    mapping(uint256 => mapping(address => PoolStructs.UserContribution[])) public userContributions;
+    mapping(uint256 => mapping(address => PoolStructs.UserContribution)) public userContributions;
+    mapping(uint256 => uint256[]) public auctionWinners; // auctionId => winning pool IDs
+    mapping(uint256 => mapping(uint256 => bool)) public auctionPoolWins; // auctionId => poolId => won
     
     // Events
     event PoolCreated(
@@ -105,7 +132,8 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
         address indexed labelToken,
         uint256 goal,
         uint256 deadline,
-        address multisigWallet
+        address ethMultisig,
+        address solMultisig
     );
     
     event ContributionMade(
@@ -116,11 +144,12 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
     );
     
     event GoalReached(uint256 indexed poolId, uint256 totalAmount);
-    event PoolWon(uint256 indexed poolId, uint256 bidAmount);
-    event RewardsReceived(uint256 indexed poolId, address rewardToken, uint256 amount);
-    event RewardsDistributed(uint256 indexed poolId, address indexed user, uint256 amount);
+    event PoolWon(uint256 indexed poolId, uint256 indexed auctionId, uint256 bidAmount);
+    event RewardsReceived(uint256 indexed poolId, uint256 indexed auctionId, address rewardToken, uint256 amount, uint8 targetChain);
+    event RewardsDistributed(uint256 indexed poolId, uint256 indexed auctionId, address indexed user, uint256 amount);
     event PoolExpired(uint256 indexed poolId);
     event TokensReturned(uint256 indexed poolId, address indexed user, uint256 amount);
+    event CrossChainRewardInitiated(uint256 indexed poolId, uint256 indexed auctionId, uint8 targetChain);
     
     // Modifiers
     modifier onlyAuctionManager() {
@@ -130,6 +159,11 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
     
     modifier onlyRewardDistributor() {
         require(msg.sender == rewardDistributor, "Only reward distributor can call this");
+        _;
+    }
+    
+    modifier onlyCrossChainManager() {
+        require(msg.sender == crossChainRewardManager, "Only cross-chain manager can call this");
         _;
     }
     
@@ -149,30 +183,28 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
         address _pndcToken,
         address _auctionManager,
         address _rewardDistributor,
-        address _bridgeContract
+        address _crossChainRewardManager
     ) {
         pndcToken = IERC20(_pndcToken);
         auctionManager = _auctionManager;
         rewardDistributor = _rewardDistributor;
-        bridgeContract = _bridgeContract;
+        crossChainRewardManager = _crossChainRewardManager;
         nextPoolId = 1;
     }
     
     /**
-     * @dev Create a new pool
-     * @param labelToken The SPL or ERC-20 token address this pool represents
-     * @param goal Target amount for the pool (must be between MIN_GOAL and MAX_GOAL)
-     * @param durationWeeks How many weeks the pool should remain active
-     * @param multisigWallet Associated multisig wallet for this pool
+     * @dev Create a new pool with both ETH and SOL multisig support
      */
     function createPool(
         address labelToken,
         uint256 goal,
         uint256 durationWeeks,
-        address multisigWallet
+        address ethMultisigWallet,
+        address solMultisigWallet
     ) external nonReentrant whenNotPaused returns (uint256) {
         require(labelToken != address(0), "Invalid label token");
-        require(multisigWallet != address(0), "Invalid multisig wallet");
+        require(ethMultisigWallet != address(0), "Invalid ETH multisig wallet");
+        require(solMultisigWallet != address(0), "Invalid SOL multisig wallet");
         require(goal >= MIN_GOAL && goal <= MAX_GOAL, "Invalid goal amount");
         require(goal % GOAL_INCREMENT == 0, "Goal must be in 50B increments");
         require(durationWeeks >= MIN_WEEKS && durationWeeks <= MAX_WEEKS, "Invalid duration");
@@ -188,20 +220,18 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
         newPool.goalMet = false;
         newPool.hasWon = false;
         newPool.isComplete = false;
-        newPool.multisigWallet = multisigWallet;
+        newPool.ethMultisigWallet = ethMultisigWallet;
+        newPool.solMultisigWallet = solMultisigWallet;
         newPool.totalContributors = 0;
-        newPool.rewardAmount = 0;
-        newPool.rewardsDistributed = false;
+        newPool.winningAuctionId = 0;
         
-        emit PoolCreated(poolId, msg.sender, labelToken, goal, newPool.deadline, multisigWallet);
+        emit PoolCreated(poolId, msg.sender, labelToken, goal, newPool.deadline, ethMultisigWallet, solMultisigWallet);
         
         return poolId;
     }
     
     /**
      * @dev Contribute PNDC tokens to a pool
-     * @param poolId The ID of the pool to contribute to
-     * @param amount Amount of PNDC tokens to contribute
      */
     function contributeToPool(uint256 poolId, uint256 amount) 
         external 
@@ -216,14 +246,13 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
         
         // Check if pool is accepting contributions (not during active auction if goal met)
         if (pool.goalMet) {
-            // Pool can only accept contributions if no auction is active
             require(!_isAuctionActive(), "Pool not accepting contributions during auction");
         }
         
         require(pool.currentAmount + amount <= MAX_POOL_AMOUNT, "Pool would exceed maximum capacity");
         
-        // Transfer tokens from user to multisig wallet
-        pndcToken.safeTransferFrom(msg.sender, pool.multisigWallet, amount);
+        // Transfer tokens from user to ETH multisig wallet (primary storage)
+        pndcToken.safeTransferFrom(msg.sender, pool.ethMultisigWallet, amount);
         
         // Update pool state
         pool.currentAmount += amount;
@@ -236,11 +265,8 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
         }
         
         pool.contributions[msg.sender] += amount;
-        userContributions[poolId][msg.sender].push(PoolStructs.UserContribution({
-            amount: amount,
-            timestamp: block.timestamp,
-            rewardsClaimed: false
-        }));
+        userContributions[poolId][msg.sender].amount += amount;
+        userContributions[poolId][msg.sender].timestamp = block.timestamp;
         
         // Check if goal is reached
         if (!pool.goalMet && pool.currentAmount >= pool.goal) {
@@ -252,7 +278,7 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
     }
     
     /**
-     * @dev Get pool information
+     * @dev Get pool information with auction ID
      */
     function getPoolInfo(uint256 poolId) 
         external 
@@ -267,7 +293,8 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
             bool isActive,
             bool goalMet,
             bool hasWon,
-            address multisigWallet
+            address multisigWallet,
+            uint256 winningAuctionId
         ) 
     {
         PoolStructs.Pool storage pool = pools[poolId];
@@ -279,8 +306,17 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
             pool.isActive,
             pool.goalMet,
             pool.hasWon,
-            pool.multisigWallet
+            pool.ethMultisigWallet, // Return primary multisig
+            pool.winningAuctionId
         );
+    }
+    
+    /**
+     * @dev Get both multisig addresses for a pool
+     */
+    function getPoolMultisigs(uint256 poolId) external view validPool(poolId) returns (address ethMultisig, address solMultisig) {
+        PoolStructs.Pool storage pool = pools[poolId];
+        return (pool.ethMultisigWallet, pool.solMultisigWallet);
     }
     
     /**
@@ -296,52 +332,71 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
     }
     
     /**
-     * @dev Mark pool as auction winner (only auction manager can call)
+     * @dev Mark pool as auction winner with auction ID tracking
      */
-    function markPoolAsWinner(uint256 poolId) external override onlyAuctionManager {
+    function markPoolAsWinner(uint256 poolId, uint256 auctionId) external override onlyAuctionManager {
         PoolStructs.Pool storage pool = pools[poolId];
         require(pool.goalMet, "Pool goal not met");
         require(!pool.hasWon, "Pool already won");
+        require(auctionId > 0, "Invalid auction ID");
         
         pool.hasWon = true;
+        pool.winningAuctionId = auctionId;
         pool.isActive = false; // Stop accepting new contributions
         
-        emit PoolWon(poolId, pool.currentAmount);
+        // Track auction winners
+        auctionWinners[auctionId].push(poolId);
+        auctionPoolWins[auctionId][poolId] = true;
+        
+        emit PoolWon(poolId, auctionId, pool.currentAmount);
     }
     
     /**
-     * @dev Distribute rewards to pool (only reward distributor can call)
+     * @dev Distribute rewards for specific auction with cross-chain support
      */
-    function distributeRewards(uint256 poolId, address rewardToken, uint256 amount) 
-        external 
-        override 
-        onlyRewardDistributor 
-    {
+    function distributeRewards(
+        uint256 poolId, 
+        uint256 auctionId, 
+        address rewardToken, 
+        uint256 amount,
+        uint8 targetChain
+    ) external override onlyRewardDistributor {
         PoolStructs.Pool storage pool = pools[poolId];
         require(pool.hasWon, "Pool has not won an auction");
-        require(!pool.rewardsDistributed, "Rewards already distributed");
+        require(pool.winningAuctionId == auctionId, "Auction ID mismatch");
+        require(auctionPoolWins[auctionId][poolId], "Pool did not win this auction");
+        require(targetChain == ETHEREUM_CHAIN || targetChain == SOLANA_CHAIN, "Invalid target chain");
         
-        pool.rewardToken = rewardToken;
-        pool.rewardAmount = amount;
+        // Initialize reward info for this auction
+        PoolStructs.RewardInfo storage rewardInfo = pool.auctionRewards[auctionId];
+        require(!rewardInfo.distributed, "Rewards already distributed for this auction");
         
-        emit RewardsReceived(poolId, rewardToken, amount);
+        rewardInfo.totalAmount = amount;
+        rewardInfo.rewardToken = rewardToken;
+        rewardInfo.targetChain = targetChain;
         
-        _distributeRewardsToUsers(poolId);
+        emit RewardsReceived(poolId, auctionId, rewardToken, amount, targetChain);
+        
+        if (targetChain == ETHEREUM_CHAIN) {
+            _distributeRewardsOnEthereum(poolId, auctionId, rewardToken, amount);
+        } else {
+            _initiateCrossChainDistribution(poolId, auctionId, rewardToken, amount);
+        }
     }
     
     /**
-     * @dev Internal function to distribute rewards to users
+     * @dev Internal function to distribute rewards on Ethereum
      */
-    function _distributeRewardsToUsers(uint256 poolId) internal {
+    function _distributeRewardsOnEthereum(uint256 poolId, uint256 auctionId, address rewardToken, uint256 amount) internal {
         PoolStructs.Pool storage pool = pools[poolId];
-        require(pool.rewardAmount > 0, "No rewards to distribute");
+        PoolStructs.RewardInfo storage rewardInfo = pool.auctionRewards[auctionId];
         
         // Calculate system fee (3%)
-        uint256 systemFee = (pool.rewardAmount * SYSTEM_FEE_PERCENTAGE) / 100;
-        uint256 userRewards = pool.rewardAmount - systemFee;
+        uint256 systemFee = (amount * SYSTEM_FEE_PERCENTAGE) / 100;
+        uint256 userRewards = amount - systemFee;
         
         // Transfer system fee to owner
-        IERC20(pool.rewardToken).safeTransfer(owner(), systemFee);
+        IERC20(rewardToken).safeTransfer(owner(), systemFee);
         
         // Distribute rewards proportionally
         for (uint256 i = 0; i < pool.contributors.length; i++) {
@@ -350,13 +405,53 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
             uint256 userReward = (userRewards * userContribution) / pool.currentAmount;
             
             if (userReward > 0) {
-                IERC20(pool.rewardToken).safeTransfer(contributor, userReward);
-                emit RewardsDistributed(poolId, contributor, userReward);
+                rewardInfo.userRewards[contributor] = userReward;
+                IERC20(rewardToken).safeTransfer(contributor, userReward);
+                userContributions[poolId][contributor].rewardsClaimed[auctionId] = true;
+                emit RewardsDistributed(poolId, auctionId, contributor, userReward);
             }
         }
         
-        pool.rewardsDistributed = true;
-        pool.isComplete = true;
+        rewardInfo.distributed = true;
+        
+        // Check if all auctions for this pool are complete
+        if (_allAuctionRewardsDistributed(poolId)) {
+            pool.isComplete = true;
+        }
+    }
+    
+    /**
+     * @dev Initiate cross-chain reward distribution to Solana
+     */
+    function _initiateCrossChainDistribution(uint256 poolId, uint256 auctionId, address rewardToken, uint256 amount) internal {
+        // This would integrate with cross-chain bridge
+        emit CrossChainRewardInitiated(poolId, auctionId, SOLANA_CHAIN);
+        
+        // Mark as distributed since cross-chain manager will handle actual distribution
+        pools[poolId].auctionRewards[auctionId].distributed = true;
+    }
+    
+    /**
+     * @dev Check if all auction rewards have been distributed for a pool
+     */
+    function _allAuctionRewardsDistributed(uint256 poolId) internal view returns (bool) {
+        // This would check all auctions the pool participated in
+        // For now, simplified to single auction
+        return pools[poolId].auctionRewards[pools[poolId].winningAuctionId].distributed;
+    }
+    
+    /**
+     * @dev Get user's reward for specific auction
+     */
+    function getUserRewardForAuction(uint256 poolId, uint256 auctionId, address user) external view returns (uint256) {
+        return pools[poolId].auctionRewards[auctionId].userRewards[user];
+    }
+    
+    /**
+     * @dev Get auction winners
+     */
+    function getAuctionWinners(uint256 auctionId) external view returns (uint256[] memory) {
+        return auctionWinners[auctionId];
     }
     
     /**
@@ -384,20 +479,6 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
         pool.isComplete = true;
         
         emit PoolExpired(poolId);
-    }
-    
-    /**
-     * @dev Get user's contribution to a specific pool
-     */
-    function getUserContribution(uint256 poolId, address user) external view returns (uint256) {
-        return pools[poolId].contributions[user];
-    }
-    
-    /**
-     * @dev Get all pools a user has participated in
-     */
-    function getUserPools(address user) external view returns (uint256[] memory) {
-        return userPools[user];
     }
     
     /**
@@ -466,30 +547,24 @@ contract PNDCPoolManager is IPNDCPoolManager, ReentrancyGuard, Ownable, Pausable
     }
     
     /**
-     * @dev Update auction manager address
+     * @dev Update contract addresses
      */
     function updateAuctionManager(address _auctionManager) external onlyOwner {
         auctionManager = _auctionManager;
     }
     
-    /**
-     * @dev Update reward distributor address
-     */
     function updateRewardDistributor(address _rewardDistributor) external onlyOwner {
         rewardDistributor = _rewardDistributor;
     }
     
-    /**
-     * @dev Update bridge contract address
-     */
-    function updateBridgeContract(address _bridgeContract) external onlyOwner {
-        bridgeContract = _bridgeContract;
+    function updateCrossChainRewardManager(address _crossChainRewardManager) external onlyOwner {
+        crossChainRewardManager = _crossChainRewardManager;
     }
 }
 
 /**
  * @title AuctionManager
- * @dev Manages the auction process and bidding logic
+ * @dev Manages multiple simultaneous auctions with unique IDs
  */
 contract AuctionManager is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -497,115 +572,354 @@ contract AuctionManager is Ownable, ReentrancyGuard {
     IPNDCPoolManager public poolManager;
     IERC20 public pndcToken;
     
-    PoolStructs.AuctionState public currentAuction;
+    // Track multiple active auctions
+    mapping(uint256 => PoolStructs.AuctionState) public auctions;
+    mapping(uint256 => bool) public activeAuctions;
+    uint256[] public activeAuctionIds;
+    uint256 public nextAuctionId;
     
-    event AuctionStarted(uint256 indexed auctionId, uint256 startTime, uint256[] eligiblePools);
+    event AuctionStarted(uint256 indexed auctionId, uint256 startTime, uint256 endTime, uint256[] eligiblePools);
     event BidPlaced(uint256 indexed auctionId, uint256 indexed poolId, uint256 amount);
-    event AuctionEnded(uint256 indexed auctionId, uint256 winningPool, uint256 winningAmount);
+    event AuctionEnded(uint256 indexed auctionId, uint256[] winningPools);
     
     constructor(address _poolManager, address _pndcToken) {
         poolManager = IPNDCPoolManager(_poolManager);
         pndcToken = IERC20(_pndcToken);
+        nextAuctionId = 1;
     }
     
     /**
-     * @dev Start a new auction
+     * @dev Start a new auction with unique ID
      */
-    function startAuction(uint256 duration) external onlyOwner {
-        require(!currentAuction.isActive, "Auction already active");
+    function startAuction(uint256 externalAuctionId, uint256 duration) external onlyOwner returns (uint256) {
+        require(!activeAuctions[externalAuctionId], "Auction ID already exists");
         
         // Get eligible pools from pool manager
         uint256[] memory eligiblePools = PNDCPoolManager(address(poolManager)).getEligiblePools();
         require(eligiblePools.length > 0, "No eligible pools");
         
-        currentAuction.isActive = true;
-        currentAuction.startTime = block.timestamp;
-        currentAuction.endTime = block.timestamp + duration;
-        currentAuction.eligiblePools = eligiblePools;
-        currentAuction.hasWinner = false;
-        currentAuction.winningPool = 0;
+        uint256 auctionId = externalAuctionId > 0 ? externalAuctionId : nextAuctionId++;
         
-        emit AuctionStarted(block.timestamp, block.timestamp, eligiblePools);
+        PoolStructs.AuctionState storage auction = auctions[auctionId];
+        auction.auctionId = auctionId;
+        auction.isActive = true;
+        auction.startTime = block.timestamp;
+        auction.endTime = block.timestamp + duration;
+        auction.eligiblePools = eligiblePools;
+        
+        activeAuctions[auctionId] = true;
+        activeAuctionIds.push(auctionId);
+        
+        emit AuctionStarted(auctionId, auction.startTime, auction.endTime, eligiblePools);
+        
+        return auctionId;
     }
     
     /**
-     * @dev Place bid for the highest eligible pool
+     * @dev Place bid for specific auction
      */
-    function placeBid() external nonReentrant {
-        require(currentAuction.isActive, "No active auction");
-        require(block.timestamp <= currentAuction.endTime, "Auction has ended");
-        require(!currentAuction.hasWinner, "Auction already has winner");
+    function placeBid(uint256 auctionId) external nonReentrant returns (uint256[] memory winningPools) {
+        require(activeAuctions[auctionId], "Auction not active");
         
-        // Get the largest eligible pool
-        uint256 winningPoolId = currentAuction.eligiblePools[0];
+        PoolStructs.AuctionState storage auction = auctions[auctionId];
+        require(auction.isActive, "Auction not active");
+        require(block.timestamp <= auction.endTime, "Auction has ended");
+        
+        // Get eligible pools and select winners (could be multiple)
+        uint256[] memory eligiblePools = auction.eligiblePools;
+        require(eligiblePools.length > 0, "No eligible pools");
+        
+        // For now, select the largest pool as winner
+        // In practice, this could select multiple pools based on auction rules
+        uint256 winningPoolId = eligiblePools[0];
         
         // Mark pool as winner
-        poolManager.markPoolAsWinner(winningPoolId);
+        poolManager.markPoolAsWinner(winningPoolId, auctionId);
         
-        // Update auction state
-        currentAuction.hasWinner = true;
-        currentAuction.winningPool = winningPoolId;
-        currentAuction.isActive = false;
+        // Track winning pools
+        auction.winningPools.push(winningPoolId);
+        auction.poolWon[winningPoolId] = true;
+        auction.isActive = false;
+        
+        // Remove from active auctions
+        activeAuctions[auctionId] = false;
+        _removeFromActiveAuctions(auctionId);
         
         // Get pool info for bid amount
-        (, , uint256 bidAmount, , , , , ) = poolManager.getPoolInfo(winningPoolId);
+        (, , uint256 bidAmount, , , , , , ) = poolManager.getPoolInfo(winningPoolId);
         
-        emit BidPlaced(currentAuction.startTime, winningPoolId, bidAmount);
-        emit AuctionEnded(currentAuction.startTime, winningPoolId, bidAmount);
+        emit BidPlaced(auctionId, winningPoolId, bidAmount);
+        emit AuctionEnded(auctionId, auction.winningPools);
+        
+        return auction.winningPools;
     }
     
     /**
      * @dev End auction manually
      */
-    function endAuction() external onlyOwner {
-        require(currentAuction.isActive, "No active auction");
-        currentAuction.isActive = false;
+    function endAuction(uint256 auctionId) external onlyOwner {
+        require(activeAuctions[auctionId], "Auction not active");
         
-        emit AuctionEnded(currentAuction.startTime, currentAuction.winningPool, 0);
+        auctions[auctionId].isActive = false;
+        activeAuctions[auctionId] = false;
+        _removeFromActiveAuctions(auctionId);
+        
+        emit AuctionEnded(auctionId, auctions[auctionId].winningPools);
     }
     
     /**
-     * @dev Get current auction state
+     * @dev Get specific auction state
      */
-    function getCurrentAuction() external view returns (
+    function getAuction(uint256 auctionId) external view returns (
+        uint256 id,
         bool isActive,
         uint256 startTime,
         uint256 endTime,
         uint256[] memory eligiblePools,
-        uint256 winningPool,
-        bool hasWinner
+        uint256[] memory winningPools
     ) {
+        PoolStructs.AuctionState storage auction = auctions[auctionId];
         return (
-            currentAuction.isActive,
-            currentAuction.startTime,
-            currentAuction.endTime,
-            currentAuction.eligiblePools,
-            currentAuction.winningPool,
-            currentAuction.hasWinner
+            auction.auctionId,
+            auction.isActive,
+            auction.startTime,
+            auction.endTime,
+            auction.eligiblePools,
+            auction.winningPools
+        );
+    }
+    
+    /**
+     * @dev Get all active auction IDs
+     */
+    function getActiveAuctions() external view returns (uint256[] memory) {
+        return activeAuctionIds;
+    }
+    
+    /**
+     * @dev Check if specific auction is active
+     */
+    function isAuctionActive(uint256 auctionId) external view returns (bool) {
+        return activeAuctions[auctionId] && auctions[auctionId].isActive;
+    }
+    
+    /**
+     * @dev Remove auction from active list
+     */
+    function _removeFromActiveAuctions(uint256 auctionId) internal {
+        for (uint256 i = 0; i < activeAuctionIds.length; i++) {
+            if (activeAuctionIds[i] == auctionId) {
+                activeAuctionIds[i] = activeAuctionIds[activeAuctionIds.length - 1];
+                activeAuctionIds.pop();
+                break;
+            }
+        }
+    }
+}
+
+/**
+ * @title CrossChainRewardManager
+ * @dev Handles cross-chain reward distribution and coordination
+ */
+contract CrossChainRewardManager is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    
+    IPNDCPoolManager public poolManager;
+    address public bridgeContract;
+    
+    // Chain identifiers
+    uint8 public constant ETHEREUM_CHAIN = 1;
+    uint8 public constant SOLANA_CHAIN = 2;
+    
+    struct RewardDistribution {
+        uint256 auctionId;
+        uint256 poolId;
+        address rewardToken;
+        uint256 totalAmount;
+        uint8 sourceChain;
+        uint8 targetChain;
+        mapping(address => uint256) userAllocations;
+        bool calculated;
+        bool distributed;
+        bytes32 distributionHash;
+    }
+    
+    mapping(bytes32 => RewardDistribution) public distributions; // hash(auctionId, poolId, chain)
+    mapping(address => bool) public authorizedMultisigs;
+    mapping(uint8 => mapping(address => bool)) public chainMultisigs; // chain => multisig => authorized
+    
+    event RewardDistributionInitiated(bytes32 indexed distributionId, uint256 auctionId, uint256 poolId, uint8 targetChain);
+    event CrossChainMessageSent(bytes32 indexed messageId, uint8 targetChain, bytes data);
+    event RewardCalculated(bytes32 indexed distributionId, uint256 totalUsers, uint256 totalAmount);
+    event CrossChainRewardDistributed(bytes32 indexed distributionId, address indexed user, uint256 amount);
+    
+    constructor(address _poolManager, address _bridgeContract) {
+        poolManager = IPNDCPoolManager(_poolManager);
+        bridgeContract = _bridgeContract;
+    }
+    
+    /**
+     * @dev Authorize multisig for specific chain
+     */
+    function authorizeChainMultisig(uint8 chainId, address multisig) external onlyOwner {
+        chainMultisigs[chainId][multisig] = true;
+        authorizedMultisigs[multisig] = true;
+    }
+    
+    /**
+     * @dev Initiate cross-chain reward distribution
+     */
+    function initiateCrossChainDistribution(
+        uint256 auctionId,
+        uint256 poolId,
+        address rewardToken,
+        uint256 amount,
+        uint8 sourceChain,
+        uint8 targetChain
+    ) external onlyOwner returns (bytes32) {
+        require(targetChain == ETHEREUM_CHAIN || targetChain == SOLANA_CHAIN, "Invalid target chain");
+        require(sourceChain != targetChain, "Source and target chain cannot be same");
+        
+        bytes32 distributionId = keccak256(abi.encodePacked(auctionId, poolId, targetChain, block.timestamp));
+        
+        RewardDistribution storage distribution = distributions[distributionId];
+        distribution.auctionId = auctionId;
+        distribution.poolId = poolId;
+        distribution.rewardToken = rewardToken;
+        distribution.totalAmount = amount;
+        distribution.sourceChain = sourceChain;
+        distribution.targetChain = targetChain;
+        distribution.calculated = false;
+        distribution.distributed = false;
+        
+        emit RewardDistributionInitiated(distributionId, auctionId, poolId, targetChain);
+        
+        // Calculate user allocations
+        _calculateUserAllocations(distributionId);
+        
+        return distributionId;
+    }
+    
+    /**
+     * @dev Calculate proportional reward allocations for users
+     */
+    function _calculateUserAllocations(bytes32 distributionId) internal {
+        RewardDistribution storage distribution = distributions[distributionId];
+        
+        // Get pool info and contributors
+        (, , uint256 totalPoolAmount, , , , , , ) = poolManager.getPoolInfo(distribution.poolId);
+        
+        // This would get all contributors and their contributions
+        // For now, this is simplified - in practice would iterate through all contributors
+        
+        distribution.calculated = true;
+        distribution.distributionHash = keccak256(abi.encodePacked(distributionId, totalPoolAmount));
+        
+        emit RewardCalculated(distributionId, 0, distribution.totalAmount); // 0 users for now
+    }
+    
+    /**
+     * @dev Execute cross-chain distribution via bridge
+     */
+    function executeCrossChainDistribution(bytes32 distributionId) external onlyOwner {
+        RewardDistribution storage distribution = distributions[distributionId];
+        require(distribution.calculated, "Allocations not calculated");
+        require(!distribution.distributed, "Already distributed");
+        
+        // Prepare cross-chain message
+        bytes memory message = abi.encode(
+            distributionId,
+            distribution.auctionId,
+            distribution.poolId,
+            distribution.rewardToken,
+            distribution.totalAmount
+        );
+        
+        // Send via bridge contract
+        bytes32 messageId = keccak256(abi.encodePacked(message, block.timestamp));
+        
+        // This would integrate with actual bridge contract
+        emit CrossChainMessageSent(messageId, distribution.targetChain, message);
+        
+        distribution.distributed = true;
+    }
+    
+    /**
+     * @dev Process incoming cross-chain reward distribution
+     */
+    function processCrossChainReward(
+        bytes32 distributionId,
+        uint256 auctionId,
+        uint256 poolId,
+        address rewardToken,
+        uint256 amount,
+        bytes calldata proof
+    ) external {
+        require(authorizedMultisigs[msg.sender], "Not authorized multisig");
+        
+        // Verify proof and process distribution
+        // This would include signature verification and replay protection
+        
+        RewardDistribution storage distribution = distributions[distributionId];
+        require(!distribution.distributed, "Already processed");
+        
+        distribution.distributed = true;
+        
+        // Notify pool manager of successful cross-chain distribution
+        // In practice, this would trigger actual token distributions
+    }
+    
+    /**
+     * @dev Get distribution info
+     */
+    function getDistribution(bytes32 distributionId) external view returns (
+        uint256 auctionId,
+        uint256 poolId,
+        address rewardToken,
+        uint256 totalAmount,
+        uint8 sourceChain,
+        uint8 targetChain,
+        bool calculated,
+        bool distributed
+    ) {
+        RewardDistribution storage distribution = distributions[distributionId];
+        return (
+            distribution.auctionId,
+            distribution.poolId,
+            distribution.rewardToken,
+            distribution.totalAmount,
+            distribution.sourceChain,
+            distribution.targetChain,
+            distribution.calculated,
+            distribution.distributed
         );
     }
 }
 
 /**
  * @title RewardDistributor
- * @dev Handles reward distribution and cross-chain bridging
+ * @dev Enhanced reward distribution with auction ID and cross-chain support
  */
 contract RewardDistributor is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     
     IPNDCPoolManager public poolManager;
+    CrossChainRewardManager public crossChainManager;
     address public bridgeContract;
     
     mapping(address => bool) public supportedRewardTokens;
-    mapping(uint256 => bool) public rewardsProcessed;
+    mapping(bytes32 => bool) public rewardsProcessed; // hash(auctionId, poolId)
+    mapping(uint256 => mapping(uint256 => bool)) public auctionRewardsProcessed; // auctionId => poolId => processed
     
     event RewardTokenAdded(address indexed token);
     event RewardTokenRemoved(address indexed token);
-    event RewardsProcessed(uint256 indexed poolId, address rewardToken, uint256 amount);
-    event SPLTokensBridged(address indexed splToken, uint256 amount, uint256 ethReceived);
+    event RewardsProcessed(uint256 indexed poolId, uint256 indexed auctionId, address rewardToken, uint256 amount);
+    event SPLTokensBridged(uint256 indexed auctionId, address indexed splToken, uint256 amount, uint256 ethReceived);
+    event CrossChainRewardDetected(uint256 indexed auctionId, uint256 indexed poolId, uint8 targetChain);
     
-    constructor(address _poolManager, address _bridgeContract) {
+    constructor(address _poolManager, address _crossChainManager, address _bridgeContract) {
         poolManager = IPNDCPoolManager(_poolManager);
+        crossChainManager = CrossChainRewardManager(_crossChainManager);
         bridgeContract = _bridgeContract;
     }
     
@@ -626,39 +940,60 @@ contract RewardDistributor is Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Process rewards for a winning pool
+     * @dev Process rewards for a specific auction winner
      */
     function processRewards(
         uint256 poolId,
+        uint256 auctionId,
         address rewardToken,
         uint256 amount,
-        bool isSPLToken
+        bool isSPLToken,
+        uint8 targetChain
     ) external nonReentrant onlyOwner {
-        require(!rewardsProcessed[poolId], "Rewards already processed");
-        require(supportedRewardTokens[rewardToken], "Unsupported reward token");
+        bytes32 rewardKey = keccak256(abi.encodePacked(auctionId, poolId));
+        require(!rewardsProcessed[rewardKey], "Rewards already processed for this auction");
+        require(!auctionRewardsProcessed[auctionId][poolId], "Auction rewards already processed");
+        require(supportedRewardTokens[rewardToken] || isSPLToken, "Unsupported reward token");
         
         if (isSPLToken) {
-            // Bridge SPL tokens to ETH
-            uint256 ethAmount = _bridgeAndSwapSPLToETH(rewardToken, amount);
-            poolManager.distributeRewards(poolId, address(0), ethAmount); // address(0) represents ETH
+            // Bridge SPL tokens and determine target chain
+            uint256 bridgedAmount = _bridgeAndSwapSPLToEth(auctionId, rewardToken, amount);
             
-            emit SPLTokensBridged(rewardToken, amount, ethAmount);
+            if (targetChain == 2) { // Solana
+                // Initiate cross-chain distribution back to Solana
+                crossChainManager.initiateCrossChainDistribution(
+                    auctionId, poolId, address(0), bridgedAmount, 1, 2 // ETH to SOL
+                );
+                emit CrossChainRewardDetected(auctionId, poolId, targetChain);
+            } else {
+                // Distribute on Ethereum
+                poolManager.distributeRewards(poolId, auctionId, address(0), bridgedAmount, 1);
+            }
+            
+            emit SPLTokensBridged(auctionId, rewardToken, amount, bridgedAmount);
         } else {
-            // Direct ERC-20 distribution
-            IERC20(rewardToken).safeTransfer(address(poolManager), amount);
-            poolManager.distributeRewards(poolId, rewardToken, amount);
+            // Direct ERC-20 or ETH distribution
+            if (targetChain == 1) { // Ethereum
+                IERC20(rewardToken).safeTransfer(address(poolManager), amount);
+                poolManager.distributeRewards(poolId, auctionId, rewardToken, amount, 1);
+            } else { // Cross-chain to Solana
+                crossChainManager.initiateCrossChainDistribution(
+                    auctionId, poolId, rewardToken, amount, 1, 2
+                );
+                emit CrossChainRewardDetected(auctionId, poolId, targetChain);
+            }
         }
         
-        rewardsProcessed[poolId] = true;
-        emit RewardsProcessed(poolId, rewardToken, amount);
+        rewardsProcessed[rewardKey] = true;
+        auctionRewardsProcessed[auctionId][poolId] = true;
+        
+        emit RewardsProcessed(poolId, auctionId, rewardToken, amount);
     }
     
     /**
      * @dev Bridge SPL tokens and swap to ETH
      */
-    function _bridgeAndSwapSPLToETH(address splToken, uint256 amount) internal returns (uint256) {
-        // This would integrate with your bridge contract
-        // Placeholder implementation
+    function _bridgeAndSwapSPLToEth(uint256 auctionId, address splToken, uint256 amount) internal returns (uint256) {
         require(bridgeContract != address(0), "Bridge contract not set");
         
         // In a real implementation, this would:
@@ -671,10 +1006,61 @@ contract RewardDistributor is Ownable, ReentrancyGuard {
     }
     
     /**
+     * @dev Process multiple auction rewards in batch
+     */
+    function batchProcessRewards(
+        uint256[] calldata poolIds,
+        uint256[] calldata auctionIds,
+        address[] calldata rewardTokens,
+        uint256[] calldata amounts,
+        bool[] calldata isSPLTokens,
+        uint8[] calldata targetChains
+    ) external onlyOwner {
+        require(poolIds.length == auctionIds.length, "Array length mismatch");
+        require(auctionIds.length == rewardTokens.length, "Array length mismatch");
+        require(rewardTokens.length == amounts.length, "Array length mismatch");
+        require(amounts.length == isSPLTokens.length, "Array length mismatch");
+        require(isSPLTokens.length == targetChains.length, "Array length mismatch");
+        
+        for (uint256 i = 0; i < poolIds.length; i++) {
+            this.processRewards(
+                poolIds[i],
+                auctionIds[i], 
+                rewardTokens[i],
+                amounts[i],
+                isSPLTokens[i],
+                targetChains[i]
+            );
+        }
+    }
+    
+    /**
+     * @dev Check if auction rewards have been processed
+     */
+    function areAuctionRewardsProcessed(uint256 auctionId, uint256 poolId) external view returns (bool) {
+        return auctionRewardsProcessed[auctionId][poolId];
+    }
+    
+    /**
+     * @dev Get reward processing status
+     */
+    function getRewardStatus(uint256 auctionId, uint256 poolId) external view returns (bool processed, bytes32 rewardKey) {
+        rewardKey = keccak256(abi.encodePacked(auctionId, poolId));
+        processed = rewardsProcessed[rewardKey];
+    }
+    
+    /**
      * @dev Update bridge contract
      */
     function updateBridgeContract(address _bridgeContract) external onlyOwner {
         bridgeContract = _bridgeContract;
+    }
+    
+    /**
+     * @dev Update cross-chain manager
+     */
+    function updateCrossChainManager(address _crossChainManager) external onlyOwner {
+        crossChainManager = CrossChainRewardManager(_crossChainManager);
     }
     
     /**
@@ -694,7 +1080,7 @@ contract RewardDistributor is Ownable, ReentrancyGuard {
 
 /**
  * @title MultisigWalletManager
- * @dev Manages multisig wallets for each pool
+ * @dev Enhanced multisig management with cross-chain support
  */
 contract MultisigWalletManager is Ownable {
     
@@ -702,111 +1088,245 @@ contract MultisigWalletManager is Ownable {
         address walletAddress;
         address[] owners;
         uint256 threshold;
+        uint8 chainId; // 1 = Ethereum, 2 = Solana
         bool isActive;
+        bytes32 linkedWallet; // Link to corresponding wallet on other chain
     }
     
-    mapping(uint256 => MultisigWallet) public poolWallets;
-    mapping(address => bool) public authorizedWallets;
+    struct CrossChainWalletPair {
+        address ethWallet;
+        address solWallet;
+        bool isLinked;
+        uint256 poolId;
+    }
     
-    event MultisigWalletCreated(uint256 indexed poolId, address walletAddress, address[] owners, uint256 threshold);
-    event MultisigWalletUpdated(uint256 indexed poolId, address newWalletAddress);
+    mapping(uint256 => mapping(uint8 => MultisigWallet)) public poolWallets; // poolId => chainId => wallet
+    mapping(uint256 => CrossChainWalletPair) public walletPairs; // poolId => wallet pair
+    mapping(address => bool) public authorizedWallets;
+    mapping(uint8 => mapping(address => bool)) public chainAuthorizedWallets; // chainId => wallet => authorized
+    
+    event MultisigWalletCreated(uint256 indexed poolId, uint8 indexed chainId, address walletAddress, address[] owners, uint256 threshold);
+    event CrossChainWalletsLinked(uint256 indexed poolId, address ethWallet, address solWallet);
+    event MultisigWalletUpdated(uint256 indexed poolId, uint8 indexed chainId, address newWalletAddress);
     
     /**
-     * @dev Create a multisig wallet for a pool
+     * @dev Create cross-chain multisig wallet pair for a pool
      */
-    function createMultisigWallet(
+    function createCrossChainMultisigPair(
         uint256 poolId,
+        address ethWalletAddress,
+        address[] memory ethOwners,
+        uint256 ethThreshold,
+        address solWalletAddress,
+        address[] memory solOwners,
+        uint256 solThreshold
+    ) external onlyOwner {
+        require(ethOwners.length >= ethThreshold && ethThreshold > 0, "Invalid ETH threshold");
+        require(solOwners.length >= solThreshold && solThreshold > 0, "Invalid SOL threshold");
+        
+        // Create Ethereum multisig
+        MultisigWallet storage ethWallet = poolWallets[poolId][1];
+        ethWallet.walletAddress = ethWalletAddress;
+        ethWallet.owners = ethOwners;
+        ethWallet.threshold = ethThreshold;
+        ethWallet.chainId = 1;
+        ethWallet.isActive = true;
+        
+        // Create Solana multisig
+        MultisigWallet storage solWallet = poolWallets[poolId][2];
+        solWallet.walletAddress = solWalletAddress;
+        solWallet.owners = solOwners;
+        solWallet.threshold = solThreshold;
+        solWallet.chainId = 2;
+        solWallet.isActive = true;
+        
+        // Link wallets
+        bytes32 ethHash = keccak256(abi.encodePacked(ethWalletAddress, uint8(1)));
+        bytes32 solHash = keccak256(abi.encodePacked(solWalletAddress, uint8(2)));
+        ethWallet.linkedWallet = solHash;
+        solWallet.linkedWallet = ethHash;
+        
+        // Create wallet pair
+        CrossChainWalletPair storage pair = walletPairs[poolId];
+        pair.ethWallet = ethWalletAddress;
+        pair.solWallet = solWalletAddress;
+        pair.isLinked = true;
+        pair.poolId = poolId;
+        
+        // Authorize wallets
+        authorizedWallets[ethWalletAddress] = true;
+        authorizedWallets[solWalletAddress] = true;
+        chainAuthorizedWallets[1][ethWalletAddress] = true;
+        chainAuthorizedWallets[2][solWalletAddress] = true;
+        
+        emit MultisigWalletCreated(poolId, 1, ethWalletAddress, ethOwners, ethThreshold);
+        emit MultisigWalletCreated(poolId, 2, solWalletAddress, solOwners, solThreshold);
+        emit CrossChainWalletsLinked(poolId, ethWalletAddress, solWalletAddress);
+    }
+    
+    /**
+     * @dev Get multisig wallet for specific pool and chain
+     */
+    function getPoolWallet(uint256 poolId, uint8 chainId) external view returns (
         address walletAddress,
         address[] memory owners,
-        uint256 threshold
-    ) external onlyOwner {
-        require(owners.length >= threshold, "Invalid threshold");
-        require(threshold > 0, "Threshold must be greater than 0");
-        
-        MultisigWallet storage wallet = poolWallets[poolId];
-        wallet.walletAddress = walletAddress;
-        wallet.owners = owners;
-        wallet.threshold = threshold;
-        wallet.isActive = true;
-        
-        authorizedWallets[walletAddress] = true;
-        
-        emit MultisigWalletCreated(poolId, walletAddress, owners, threshold);
+        uint256 threshold,
+        bool isActive
+    ) {
+        MultisigWallet storage wallet = poolWallets[poolId][chainId];
+        return (wallet.walletAddress, wallet.owners, wallet.threshold, wallet.isActive);
     }
     
     /**
-     * @dev Update multisig wallet for a pool
+     * @dev Get cross-chain wallet pair for pool
      */
-    function updateMultisigWallet(uint256 poolId, address newWalletAddress) external onlyOwner {
-        require(poolWallets[poolId].walletAddress != address(0), "Wallet does not exist");
+    function getWalletPair(uint256 poolId) external view returns (address ethWallet, address solWallet, bool isLinked) {
+        CrossChainWalletPair storage pair = walletPairs[poolId];
+        return (pair.ethWallet, pair.solWallet, pair.isLinked);
+    }
+    
+    /**
+     * @dev Update multisig wallet for specific chain
+     */
+    function updatePoolWallet(uint256 poolId, uint8 chainId, address newWalletAddress) external onlyOwner {
+        require(poolWallets[poolId][chainId].walletAddress != address(0), "Wallet does not exist");
         
         // Deauthorize old wallet
-        authorizedWallets[poolWallets[poolId].walletAddress] = false;
+        address oldWallet = poolWallets[poolId][chainId].walletAddress;
+        authorizedWallets[oldWallet] = false;
+        chainAuthorizedWallets[chainId][oldWallet] = false;
+        
+        // Update wallet address
+        poolWallets[poolId][chainId].walletAddress = newWalletAddress;
         
         // Authorize new wallet
-        poolWallets[poolId].walletAddress = newWalletAddress;
         authorizedWallets[newWalletAddress] = true;
+        chainAuthorizedWallets[chainId][newWalletAddress] = true;
         
-        emit MultisigWalletUpdated(poolId, newWalletAddress);
+        // Update wallet pair
+        if (chainId == 1) {
+            walletPairs[poolId].ethWallet = newWalletAddress;
+        } else if (chainId == 2) {
+            walletPairs[poolId].solWallet = newWalletAddress;
+        }
+        
+        emit MultisigWalletUpdated(poolId, chainId, newWalletAddress);
     }
     
     /**
-     * @dev Check if wallet is authorized
+     * @dev Check if wallet is authorized for specific chain
+     */
+    function isChainWalletAuthorized(uint8 chainId, address wallet) external view returns (bool) {
+        return chainAuthorizedWallets[chainId][wallet];
+    }
+    
+    /**
+     * @dev Check if wallet is authorized (any chain)
      */
     function isAuthorizedWallet(address wallet) external view returns (bool) {
         return authorizedWallets[wallet];
+    }
+    
+    /**
+     * @dev Get linked wallet address
+     */
+    function getLinkedWallet(uint256 poolId, uint8 chainId) external view returns (address) {
+        if (chainId == 1) {
+            return walletPairs[poolId].solWallet;
+        } else if (chainId == 2) {
+            return walletPairs[poolId].ethWallet;
+        }
+        return address(0);
     }
 }
 
 /**
  * @title BridgeContract
- * @dev Placeholder for cross-chain bridge functionality
+ * @dev Enhanced bridge with auction ID tracking
  */
 contract BridgeContract is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     
     mapping(address => bool) public supportedTokens;
     mapping(bytes32 => bool) public processedTransactions;
+    mapping(uint256 => mapping(bytes32 => bool)) public auctionTransactions; // auctionId => txHash => processed
     
-    event TokensBridged(address indexed token, uint256 amount, bytes32 txHash);
-    event TokensReceived(address indexed token, uint256 amount, bytes32 txHash);
+    event TokensBridged(uint256 indexed auctionId, address indexed token, uint256 amount, bytes32 txHash, uint8 targetChain);
+    event TokensReceived(uint256 indexed auctionId, address indexed token, uint256 amount, bytes32 txHash, uint8 sourceChain);
+    event CrossChainRewardBridged(uint256 indexed auctionId, uint256 indexed poolId, address token, uint256 amount);
     
     /**
-     * @dev Bridge tokens from SPL to ERC-20
+     * @dev Bridge tokens with auction ID tracking
      */
-    function bridgeFromSPL(
-        address splToken,
-        address erc20Token,
+    function bridgeTokensWithAuction(
+        uint256 auctionId,
+        address token,
         uint256 amount,
-        bytes32 txHash
-    ) external onlyOwner nonReentrant {
-        require(supportedTokens[erc20Token], "Token not supported");
-        require(!processedTransactions[txHash], "Transaction already processed");
+        uint8 targetChain
+    ) external nonReentrant returns (bytes32) {
+        require(supportedTokens[token], "Token not supported");
+        require(auctionId > 0, "Invalid auction ID");
         
+        // Transfer tokens to bridge
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        
+        bytes32 txHash = keccak256(abi.encodePacked(auctionId, token, amount, block.timestamp, msg.sender));
+        require(!auctionTransactions[auctionId][txHash], "Transaction already processed");
+        
+        auctionTransactions[auctionId][txHash] = true;
         processedTransactions[txHash] = true;
         
-        // Mint or transfer ERC-20 tokens
-        IERC20(erc20Token).safeTransfer(msg.sender, amount);
+        emit TokensBridged(auctionId, token, amount, txHash, targetChain);
         
-        emit TokensReceived(erc20Token, amount, txHash);
+        return txHash;
     }
     
     /**
-     * @dev Bridge tokens from ERC-20 to SPL
+     * @dev Receive bridged tokens with auction tracking
      */
-    function bridgeToSPL(
-        address erc20Token,
-        address splToken,
-        uint256 amount
-    ) external nonReentrant {
-        require(supportedTokens[erc20Token], "Token not supported");
+    function receiveBridgedTokens(
+        uint256 auctionId,
+        address token,
+        uint256 amount,
+        bytes32 sourceTxHash,
+        uint8 sourceChain,
+        bytes calldata proof
+    ) external onlyOwner nonReentrant {
+        require(supportedTokens[token], "Token not supported");
+        require(!auctionTransactions[auctionId][sourceTxHash], "Transaction already processed");
         
-        // Burn or lock ERC-20 tokens
-        IERC20(erc20Token).safeTransferFrom(msg.sender, address(this), amount);
+        // Verify proof (simplified)
+        require(proof.length > 0, "Invalid proof");
         
-        bytes32 txHash = keccak256(abi.encodePacked(block.timestamp, msg.sender, amount));
+        auctionTransactions[auctionId][sourceTxHash] = true;
+        processedTransactions[sourceTxHash] = true;
         
-        emit TokensBridged(erc20Token, amount, txHash);
+        // Mint or release tokens
+        IERC20(token).safeTransfer(msg.sender, amount);
+        
+        emit TokensReceived(auctionId, token, amount, sourceTxHash, sourceChain);
+    }
+    
+    /**
+     * @dev Bridge rewards for specific auction and pool
+     */
+    function bridgeAuctionRewards(
+        uint256 auctionId,
+        uint256 poolId,
+        address token,
+        uint256 amount,
+        uint8 targetChain
+    ) external onlyOwner {
+        bytes32 txHash = bridgeTokensWithAuction(auctionId, token, amount, targetChain);
+        
+        emit CrossChainRewardBridged(auctionId, poolId, token, amount);
+    }
+    
+    /**
+     * @dev Check if auction transaction was processed
+     */
+    function isAuctionTransactionProcessed(uint256 auctionId, bytes32 txHash) external view returns (bool) {
+        return auctionTransactions[auctionId][txHash];
     }
     
     /**
@@ -821,535 +1341,5 @@ contract BridgeContract is Ownable, ReentrancyGuard {
      */
     function removeSupportedToken(address token) external onlyOwner {
         supportedTokens[token] = false;
-    }
-    
-    /**
-     * @dev Check if token is supported
-     */
-    function isTokenSupported(address token) external view returns (bool) {
-        return supportedTokens[token];
-    }
-    
-    /**
-     * @dev Emergency withdrawal
-     */
-    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
-        IERC20(token).safeTransfer(owner(), amount);
-    }
-}
-
-/**
- * @title PoolFactory
- * @dev Factory contract for creating new pools with proper validation
- */
-contract PoolFactory is Ownable {
-    
-    IPNDCPoolManager public poolManager;
-    MultisigWalletManager public walletManager;
-    
-    // Pool creation fees
-    uint256 public poolCreationFee;
-    mapping(address => bool) public authorizedCreators;
-    
-    event PoolCreated(
-        uint256 indexed poolId,
-        address indexed creator,
-        address indexed labelToken,
-        uint256 goal,
-        uint256 deadline
-    );
-    
-    event PoolCreationFeeUpdated(uint256 newFee);
-    event CreatorAuthorized(address indexed creator);
-    event CreatorRevoked(address indexed creator);
-    
-    modifier onlyAuthorized() {
-        require(authorizedCreators[msg.sender] || msg.sender == owner(), "Not authorized to create pools");
-        _;
-    }
-    
-    constructor(
-        address _poolManager,
-        address _walletManager,
-        uint256 _poolCreationFee
-    ) {
-        poolManager = IPNDCPoolManager(_poolManager);
-        walletManager = MultisigWalletManager(_walletManager);
-        poolCreationFee = _poolCreationFee;
-    }
-    
-    /**
-     * @dev Create a new pool with multisig wallet
-     */
-    function createPoolWithMultisig(
-        address labelToken,
-        uint256 goal,
-        uint256 durationWeeks,
-        address[] memory multisigOwners,
-        uint256 multisigThreshold,
-        address multisigWallet
-    ) external payable onlyAuthorized {
-        require(msg.value >= poolCreationFee, "Insufficient fee");
-        
-        // Create the pool
-        uint256 poolId = poolManager.createPool(
-            labelToken,
-            goal,
-            durationWeeks,
-            multisigWallet
-        );
-        
-        // Register the multisig wallet
-        walletManager.createMultisigWallet(
-            poolId,
-            multisigWallet,
-            multisigOwners,
-            multisigThreshold
-        );
-        
-        emit PoolCreated(poolId, msg.sender, labelToken, goal, block.timestamp + (durationWeeks * 604800));
-        
-        // Refund excess fee
-        if (msg.value > poolCreationFee) {
-            payable(msg.sender).transfer(msg.value - poolCreationFee);
-        }
-    }
-    
-    /**
-     * @dev Authorize address to create pools
-     */
-    function authorizeCreator(address creator) external onlyOwner {
-        authorizedCreators[creator] = true;
-        emit CreatorAuthorized(creator);
-    }
-    
-    /**
-     * @dev Revoke pool creation authorization
-     */
-    function revokeCreator(address creator) external onlyOwner {
-        authorizedCreators[creator] = false;
-        emit CreatorRevoked(creator);
-    }
-    
-    /**
-     * @dev Update pool creation fee
-     */
-    function updatePoolCreationFee(uint256 newFee) external onlyOwner {
-        poolCreationFee = newFee;
-        emit PoolCreationFeeUpdated(newFee);
-    }
-    
-    /**
-     * @dev Withdraw collected fees
-     */
-    function withdrawFees() external onlyOwner {
-        payable(owner()).transfer(address(this).balance);
-    }
-}
-
-/**
- * @title PoolAnalytics
- * @dev Contract for tracking pool analytics and statistics
- */
-contract PoolAnalytics is Ownable {
-    
-    IPNDCPoolManager public poolManager;
-    
-    struct PoolStats {
-        uint256 totalContributions;
-        uint256 averageContribution;
-        uint256 uniqueContributors;
-        uint256 timeToGoal;
-        bool goalReached;
-        uint256 finalAmount;
-    }
-    
-    struct GlobalStats {
-        uint256 totalPools;
-        uint256 totalValueLocked;
-        uint256 successfulPools;
-        uint256 expiredPools;
-        uint256 totalRewardsDistributed;
-        uint256 totalUsers;
-    }
-    
-    mapping(uint256 => PoolStats) public poolStats;
-    mapping(address => uint256) public userTotalContributions;
-    mapping(address => uint256) public userPoolCount;
-    
-    GlobalStats public globalStats;
-    
-    event StatsUpdated(uint256 indexed poolId, uint256 newContribution);
-    event GlobalStatsUpdated(uint256 totalPools, uint256 totalValueLocked);
-    
-    constructor(address _poolManager) {
-        poolManager = IPNDCPoolManager(_poolManager);
-    }
-    
-    /**
-     * @dev Update stats when contribution is made
-     */
-    function updateContributionStats(
-        uint256 poolId,
-        address contributor,
-        uint256 amount
-    ) external {
-        require(msg.sender == address(poolManager), "Only pool manager can update stats");
-        
-        PoolStats storage stats = poolStats[poolId];
-        stats.totalContributions += amount;
-        
-        // Update user stats
-        if (userTotalContributions[contributor] == 0) {
-            globalStats.totalUsers++;
-        }
-        userTotalContributions[contributor] += amount;
-        
-        // Update global stats
-        globalStats.totalValueLocked += amount;
-        
-        emit StatsUpdated(poolId, amount);
-    }
-    
-    /**
-     * @dev Update stats when pool goal is reached
-     */
-    function updateGoalReachedStats(uint256 poolId) external {
-        require(msg.sender == address(poolManager), "Only pool manager can update stats");
-        
-        PoolStats storage stats = poolStats[poolId];
-        stats.goalReached = true;
-        stats.timeToGoal = block.timestamp;
-        
-        globalStats.successfulPools++;
-    }
-    
-    /**
-     * @dev Update stats when pool expires
-     */
-    function updateExpiredStats(uint256 poolId) external {
-        require(msg.sender == address(poolManager), "Only pool manager can update stats");
-        
-        globalStats.expiredPools++;
-    }
-    
-    /**
-     * @dev Get pool statistics
-     */
-    function getPoolStats(uint256 poolId) external view returns (PoolStats memory) {
-        return poolStats[poolId];
-    }
-    
-    /**
-     * @dev Get global statistics
-     */
-    function getGlobalStats() external view returns (GlobalStats memory) {
-        return globalStats;
-    }
-    
-    /**
-     * @dev Get user statistics
-     */
-    function getUserStats(address user) external view returns (uint256 totalContributions, uint256 poolCount) {
-        return (userTotalContributions[user], userPoolCount[user]);
-    }
-}
-
-/**
- * @title EmergencyManager
- * @dev Handles emergency situations and system maintenance
- */
-contract EmergencyManager is Ownable {
-    
-    IPNDCPoolManager public poolManager;
-    AuctionManager public auctionManager;
-    RewardDistributor public rewardDistributor;
-    
-    bool public systemPaused;
-    bool public emergencyMode;
-    
-    mapping(address => bool) public emergencyOperators;
-    
-    event SystemPaused(address indexed operator);
-    event SystemUnpaused(address indexed operator);
-    event EmergencyModeActivated(address indexed operator);
-    event EmergencyModeDeactivated(address indexed operator);
-    event EmergencyOperatorAdded(address indexed operator);
-    event EmergencyOperatorRemoved(address indexed operator);
-    
-    modifier onlyEmergencyOperator() {
-        require(emergencyOperators[msg.sender] || msg.sender == owner(), "Not authorized");
-        _;
-    }
-    
-    modifier notInEmergencyMode() {
-        require(!emergencyMode, "System in emergency mode");
-        _;
-    }
-    
-    constructor(
-        address _poolManager,
-        address _auctionManager,
-        address _rewardDistributor
-    ) {
-        poolManager = IPNDCPoolManager(_poolManager);
-        auctionManager = AuctionManager(_auctionManager);
-        rewardDistributor = RewardDistributor(_rewardDistributor);
-        
-        emergencyOperators[msg.sender] = true;
-    }
-    
-    /**
-     * @dev Pause entire system
-     */
-    function pauseSystem() external onlyEmergencyOperator {
-        systemPaused = true;
-        
-        // Pause all contracts
-        PNDCPoolManager(address(poolManager)).pause();
-        
-        emit SystemPaused(msg.sender);
-    }
-    
-    /**
-     * @dev Unpause system
-     */
-    function unpauseSystem() external onlyEmergencyOperator {
-        systemPaused = false;
-        
-        // Unpause all contracts
-        PNDCPoolManager(address(poolManager)).unpause();
-        
-        emit SystemUnpaused(msg.sender);
-    }
-    
-    /**
-     * @dev Activate emergency mode
-     */
-    function activateEmergencyMode() external onlyEmergencyOperator {
-        emergencyMode = true;
-        pauseSystem();
-        
-        emit EmergencyModeActivated(msg.sender);
-    }
-    
-    /**
-     * @dev Deactivate emergency mode
-     */
-    function deactivateEmergencyMode() external onlyOwner {
-        emergencyMode = false;
-        unpauseSystem();
-        
-        emit EmergencyModeDeactivated(msg.sender);
-    }
-    
-    /**
-     * @dev Add emergency operator
-     */
-    function addEmergencyOperator(address operator) external onlyOwner {
-        emergencyOperators[operator] = true;
-        emit EmergencyOperatorAdded(operator);
-    }
-    
-    /**
-     * @dev Remove emergency operator
-     */
-    function removeEmergencyOperator(address operator) external onlyOwner {
-        emergencyOperators[operator] = false;
-        emit EmergencyOperatorRemoved(operator);
-    }
-    
-    /**
-     * @dev Emergency withdrawal from any contract
-     */
-    function emergencyWithdraw(
-        address contractAddress,
-        address token,
-        uint256 amount,
-        address recipient
-    ) external onlyOwner {
-        require(emergencyMode, "Emergency mode not active");
-        
-        // This would call emergency withdrawal functions on target contracts
-        // Implementation depends on specific contract interfaces
-    }
-}
-
-/**
- * @title SystemGovernance
- * @dev Handles system governance and parameter updates
- */
-contract SystemGovernance is Ownable {
-    
-    struct Proposal {
-        uint256 id;
-        string description;
-        address target;
-        bytes data;
-        uint256 startTime;
-        uint256 endTime;
-        uint256 forVotes;
-        uint256 againstVotes;
-        bool executed;
-        mapping(address => bool) hasVoted;
-    }
-    
-    mapping(uint256 => Proposal) public proposals;
-    mapping(address => uint256) public votingPower;
-    
-    uint256 public nextProposalId;
-    uint256 public votingDuration = 7 days;
-    uint256 public proposalThreshold = 1000000 * 10**18; // 1M PNDC to create proposal
-    uint256 public quorumThreshold = 50; // 50% participation required
-    
-    IERC20 public governanceToken;
-    
-    event ProposalCreated(
-        uint256 indexed proposalId,
-        address indexed proposer,
-        string description,
-        uint256 startTime,
-        uint256 endTime
-    );
-    
-    event VoteCast(
-        uint256 indexed proposalId,
-        address indexed voter,
-        bool support,
-        uint256 votes
-    );
-    
-    event ProposalExecuted(uint256 indexed proposalId);
-    
-    constructor(address _governanceToken) {
-        governanceToken = IERC20(_governanceToken);
-        nextProposalId = 1;
-    }
-    
-    /**
-     * @dev Create a new proposal
-     */
-    function createProposal(
-        string memory description,
-        address target,
-        bytes memory data
-    ) external returns (uint256) {
-        require(
-            governanceToken.balanceOf(msg.sender) >= proposalThreshold,
-            "Insufficient tokens to create proposal"
-        );
-        
-        uint256 proposalId = nextProposalId++;
-        Proposal storage proposal = proposals[proposalId];
-        
-        proposal.id = proposalId;
-        proposal.description = description;
-        proposal.target = target;
-        proposal.data = data;
-        proposal.startTime = block.timestamp;
-        proposal.endTime = block.timestamp + votingDuration;
-        proposal.forVotes = 0;
-        proposal.againstVotes = 0;
-        proposal.executed = false;
-        
-        emit ProposalCreated(
-            proposalId,
-            msg.sender,
-            description,
-            proposal.startTime,
-            proposal.endTime
-        );
-        
-        return proposalId;
-    }
-    
-    /**
-     * @dev Cast vote on a proposal
-     */
-    function castVote(uint256 proposalId, bool support) external {
-        Proposal storage proposal = proposals[proposalId];
-        
-        require(block.timestamp >= proposal.startTime, "Voting not started");
-        require(block.timestamp <= proposal.endTime, "Voting ended");
-        require(!proposal.hasVoted[msg.sender], "Already voted");
-        
-        uint256 votes = governanceToken.balanceOf(msg.sender);
-        require(votes > 0, "No voting power");
-        
-        proposal.hasVoted[msg.sender] = true;
-        
-        if (support) {
-            proposal.forVotes += votes;
-        } else {
-            proposal.againstVotes += votes;
-        }
-        
-        emit VoteCast(proposalId, msg.sender, support, votes);
-    }
-    
-    /**
-     * @dev Execute a successful proposal
-     */
-    function executeProposal(uint256 proposalId) external {
-        Proposal storage proposal = proposals[proposalId];
-        
-        require(block.timestamp > proposal.endTime, "Voting still active");
-        require(!proposal.executed, "Already executed");
-        require(proposal.forVotes > proposal.againstVotes, "Proposal failed");
-        
-        uint256 totalVotes = proposal.forVotes + proposal.againstVotes;
-        uint256 totalSupply = governanceToken.totalSupply();
-        
-        require(
-            (totalVotes * 100) / totalSupply >= quorumThreshold,
-            "Quorum not reached"
-        );
-        
-        proposal.executed = true;
-        
-        // Execute the proposal
-        (bool success, ) = proposal.target.call(proposal.data);
-        require(success, "Proposal execution failed");
-        
-        emit ProposalExecuted(proposalId);
-    }
-    
-    /**
-     * @dev Get proposal details
-     */
-    function getProposal(uint256 proposalId) external view returns (
-        uint256 id,
-        string memory description,
-        address target,
-        uint256 startTime,
-        uint256 endTime,
-        uint256 forVotes,
-        uint256 againstVotes,
-        bool executed
-    ) {
-        Proposal storage proposal = proposals[proposalId];
-        return (
-            proposal.id,
-            proposal.description,
-            proposal.target,
-            proposal.startTime,
-            proposal.endTime,
-            proposal.forVotes,
-            proposal.againstVotes,
-            proposal.executed
-        );
-    }
-    
-    /**
-     * @dev Update voting parameters
-     */
-    function updateVotingParameters(
-        uint256 _votingDuration,
-        uint256 _proposalThreshold,
-        uint256 _quorumThreshold
-    ) external onlyOwner {
-        votingDuration = _votingDuration;
-        proposalThreshold = _proposalThreshold;
-        quorumThreshold = _quorumThreshold;
     }
 }
