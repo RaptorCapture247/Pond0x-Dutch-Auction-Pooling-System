@@ -1,109 +1,66 @@
-// PNDC Bot System - Complete monitoring and automation system
-// This system includes multiple specialized bots for different aspects of the platform
-
-const Web3 = require('web3');
-const { ethers } = require('ethers');
-const axios = require('axios');
-const cron = require('node-cron');
-const winston = require('winston');
-const Redis = require('redis');
-const { Connection, PublicKey } = require('@solana/web3.js');
-
-// Configuration
-const CONFIG = {
-    ethereum: {
-        rpcUrl: process.env.ETH_RPC_URL || 'https://mainnet.infura.io/v3/YOUR_KEY',
-        privateKey: process.env.ETH_PRIVATE_KEY,
-        gasPrice: process.env.GAS_PRICE || '20000000000', // 20 gwei
-        gasLimit: process.env.GAS_LIMIT || '500000'
-    },
-    solana: {
-        rpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
-        privateKey: process.env.SOLANA_PRIVATE_KEY
-    },
-    contracts: {
-        poolManager: process.env.POOL_MANAGER_ADDRESS,
-        auctionManager: process.env.AUCTION_MANAGER_ADDRESS,
-        rewardDistributor: process.env.REWARD_DISTRIBUTOR_ADDRESS,
-        bridgeContract: process.env.BRIDGE_CONTRACT_ADDRESS,
-        pndcToken: process.env.PNDC_TOKEN_ADDRESS
-    },
-    pond0x: {
-        baseUrl: 'https://pond0x.com',
-        auctionEndpoint: '/mining/bid',
-        apiKey: process.env.POND0X_API_KEY
-    },
-    redis: {
-        host: process.env.REDIS_HOST || 'localhost',
-        port: process.env.REDIS_PORT || 6379,
-        password: process.env.REDIS_PASSWORD
-    },
-    monitoring: {
-        checkInterval: 30000, // 30 seconds
-        maxRetries: 3,
-        alertWebhook: process.env.ALERT_WEBHOOK_URL
-    }
-};
-
-// Contract ABIs (simplified - you'll need the full ABIs)
-const ABIS = {
-    poolManager: [
-        "function getPoolInfo(uint256 poolId) view returns (address,uint256,uint256,uint256,bool,bool,bool,address)",
-        "function getEligiblePools() view returns (uint256[])",
-        "function isPoolEligibleForBid(uint256 poolId) view returns (bool)",
-        "function createPool(address,uint256,uint256,address) returns (uint256)",
-        "function contributeToPool(uint256,uint256)",
-        "function markPoolAsWinner(uint256)",
-        "function distributeRewards(uint256,address,uint256)",
-        "event PoolCreated(uint256 indexed,address indexed,address indexed,uint256,uint256,address)",
-        "event ContributionMade(uint256 indexed,address indexed,uint256,uint256)",
-        "event GoalReached(uint256 indexed,uint256)",
-        "event PoolWon(uint256 indexed,uint256)",
-        "event RewardsDistributed(uint256 indexed,address indexed,uint256)"
-    ],
-    auctionManager: [
-        "function startAuction(uint256)",
-        "function placeBid()",
-        "function getCurrentAuction() view returns (bool,uint256,uint256,uint256[],uint256,bool)",
-        "function endAuction()",
-        "event AuctionStarted(uint256 indexed,uint256,uint256[])",
-        "event BidPlaced(uint256 indexed,uint256 indexed,uint256)",
-        "event AuctionEnded(uint256 indexed,uint256,uint256)"
-    ],
-    rewardDistributor: [
-        "function processRewards(uint256,address,uint256,bool)",
+"function getRewardStatus(uint256,uint256) view returns (bool,bytes32)",
         "function addSupportedRewardToken(address)",
-        "event RewardsProcessed(uint256 indexed,address,uint256)",
-        "event SPLTokensBridged(address indexed,uint256,uint256)"
+        "event RewardsProcessed(uint256 indexed,uint256 indexed,address,uint256)",
+        "event SPLTokensBridged(uint256 indexed,address indexed,uint256,uint256)",
+        "event CrossChainRewardDetected(uint256 indexed,uint256 indexed,uint8)"
+    ],
+    crossChainRewardManager: [
+        "function initiateCrossChainDistribution(uint256,uint256,address,uint256,uint8,uint8) returns (bytes32)",
+        "function executeCrossChainDistribution(bytes32)",
+        "function getDistribution(bytes32) view returns (uint256,uint256,address,uint256,uint8,uint8,bool,bool)",
+        "function authorizeChainMultisig(uint8,address)",
+        "event RewardDistributionInitiated(bytes32 indexed,uint256,uint256,uint8)",
+        "event CrossChainMessageSent(bytes32 indexed,uint8,bytes)",
+        "event CrossChainRewardDistributed(bytes32 indexed,address indexed,uint256)"
+    ],
+    bridgeContract: [
+        "function bridgeTokensWithAuction(uint256,address,uint256,uint8) returns (bytes32)",
+        "function receiveBridgedTokens(uint256,address,uint256,bytes32,uint8,bytes)",
+        "function bridgeAuctionRewards(uint256,uint256,address,uint256,uint8)",
+        "function isAuctionTransactionProcessed(uint256,bytes32) view returns (bool)",
+        "event TokensBridged(uint256 indexed,address indexed,uint256,bytes32,uint8)",
+        "event CrossChainRewardBridged(uint256 indexed,uint256 indexed,address,uint256)"
     ]
 };
 
-// Logger setup
+// Logger setup with enhanced auction tracking
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
         winston.format.timestamp(),
-        winston.format.json()
+        winston.format.json(),
+        winston.format.printf(info => {
+            return JSON.stringify({
+                timestamp: info.timestamp,
+                level: info.level,
+                message: info.message,
+                auctionId: info.auctionId || null,
+                poolId: info.poolId || null,
+                chain: info.chain || null,
+                ...info
+            });
+        })
     ),
     transports: [
         new winston.transports.File({ filename: 'error.log', level: 'error' }),
-        new winston.transports.File({ filename: 'combined.log' }),
+        new winston.transports.File({ filename: 'auction.log', level: 'info' }),
         new winston.transports.Console({
             format: winston.format.simple()
         })
     ]
 });
 
-// Redis client for caching and coordination
+// Redis client for cross-chain coordination
 const redis = Redis.createClient(CONFIG.redis);
 
-// Base Bot Class
+// Enhanced Base Bot Class with Auction ID Support
 class BaseBot {
     constructor(name) {
         this.name = name;
         this.isRunning = false;
         this.retryCount = 0;
         this.maxRetries = CONFIG.monitoring.maxRetries;
+        this.activeAuctions = new Map(); // Track active auctions
         
         // Initialize Web3 and ethers
         this.web3 = new Web3(CONFIG.ethereum.rpcUrl);
@@ -112,6 +69,8 @@ class BaseBot {
         
         // Initialize Solana connection
         this.solanaConnection = new Connection(CONFIG.solana.rpcUrl);
+        this.solanaKeypair = CONFIG.solana.privateKey ? 
+            Keypair.fromSecretKey(Buffer.from(CONFIG.solana.privateKey, 'hex')) : null;
         
         // Initialize contracts
         this.initializeContracts();
@@ -135,6 +94,18 @@ class BaseBot {
             ABIS.rewardDistributor,
             this.wallet
         );
+        
+        this.crossChainRewardManager = new ethers.Contract(
+            CONFIG.contracts.crossChainRewardManager,
+            ABIS.crossChainRewardManager,
+            this.wallet
+        );
+        
+        this.bridgeContract = new ethers.Contract(
+            CONFIG.contracts.bridgeContract,
+            ABIS.bridgeContract,
+            this.wallet
+        );
     }
     
     async start() {
@@ -149,7 +120,6 @@ class BaseBot {
     }
     
     async run() {
-        // Override in subclasses
         throw new Error('run() method must be implemented');
     }
     
@@ -164,7 +134,7 @@ class BaseBot {
                 logger.warn(`Retry ${i + 1}/${this.maxRetries} failed for ${context}: ${error.message}`);
                 
                 if (i < this.maxRetries - 1) {
-                    await this.sleep(1000 * Math.pow(2, i)); // Exponential backoff
+                    await this.sleep(1000 * Math.pow(2, i));
                 }
             }
         }
@@ -176,167 +146,261 @@ class BaseBot {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
     
-    async sendAlert(message, level = 'warning') {
+    async sendAlert(message, level = 'warning', metadata = {}) {
         try {
             if (CONFIG.monitoring.alertWebhook) {
                 await axios.post(CONFIG.monitoring.alertWebhook, {
                     text: `[${level.toUpperCase()}] ${this.name}: ${message}`,
-                    timestamp: new Date().toISOString()
+                    timestamp: new Date().toISOString(),
+                    metadata
                 });
             }
             
-            logger.log(level, message);
+            logger.log(level, message, metadata);
         } catch (error) {
             logger.error(`Failed to send alert: ${error.message}`);
         }
     }
+    
+    // Enhanced logging with auction context
+    logWithContext(message, level = 'info', auctionId = null, poolId = null, chain = null) {
+        logger.log(level, message, { auctionId, poolId, chain, bot: this.name });
+    }
 }
 
-// Pond0x Auction Monitor Bot
+// Enhanced Pond0x Auction Monitor Bot with Multiple Auction Support
 class Pond0xAuctionBot extends BaseBot {
     constructor() {
         super('Pond0xAuctionBot');
-        this.lastAuctionCheck = 0;
-        this.currentAuction = null;
+        this.trackedAuctions = new Map(); // auctionId => auction data
+        this.auctionCheckInterval = CONFIG.monitoring.checkInterval;
     }
     
     async run() {
         while (this.isRunning) {
             try {
                 await this.checkForAuctions();
-                await this.sleep(CONFIG.monitoring.checkInterval);
+                await this.checkAuctionResults();
+                await this.sleep(this.auctionCheckInterval);
             } catch (error) {
-                logger.error(`Pond0x auction monitoring error: ${error.message}`);
+                this.logWithContext(`Auction monitoring error: ${error.message}`, 'error');
                 await this.sendAlert(`Auction monitoring failed: ${error.message}`, 'error');
-                await this.sleep(CONFIG.monitoring.checkInterval);
+                await this.sleep(this.auctionCheckInterval);
             }
         }
     }
     
     async checkForAuctions() {
         const auctionData = await this.retry(
-            () => this.fetchAuctionData(),
+            () => this.fetchActiveAuctions(),
             'fetching auction data'
         );
         
-        if (auctionData.isActive && !this.currentAuction) {
-            // New auction detected
-            await this.handleNewAuction(auctionData);
-        } else if (!auctionData.isActive && this.currentAuction) {
-            // Auction ended
-            await this.handleAuctionEnd();
+        // Check for new auctions
+        for (const auction of auctionData.active) {
+            if (!this.trackedAuctions.has(auction.id)) {
+                await this.handleNewAuction(auction);
+            }
         }
         
-        this.currentAuction = auctionData.isActive ? auctionData : null;
+        // Check for ended auctions
+        for (const [auctionId, trackedAuction] of this.trackedAuctions) {
+            const stillActive = auctionData.active.find(a => a.id === auctionId);
+            if (!stillActive && trackedAuction.isActive) {
+                await this.handleAuctionEnd(auctionId);
+            }
+        }
     }
     
-    async fetchAuctionData() {
-        const response = await axios.get(
-            `${CONFIG.pond0x.baseUrl}/api/auction/status`,
-            {
-                headers: {
-                    'Authorization': `Bearer ${CONFIG.pond0x.apiKey}`
-                }
-            }
-        );
+    async fetchActiveAuctions() {
+        const [statusResponse, activeResponse] = await Promise.all([
+            axios.get(`${CONFIG.pond0x.baseUrl}${CONFIG.pond0x.statusEndpoint}`, {
+                headers: { 'Authorization': `Bearer ${CONFIG.pond0x.apiKey}` }
+            }),
+            axios.get(`${CONFIG.pond0x.baseUrl}/api/auctions/active`, {
+                headers: { 'Authorization': `Bearer ${CONFIG.pond0x.apiKey}` }
+            })
+        ]);
         
-        return response.data;
+        return {
+            status: statusResponse.data,
+            active: activeResponse.data.auctions || []
+        };
     }
     
     async handleNewAuction(auctionData) {
-        logger.info('New Pond0x auction detected', auctionData);
+        this.logWithContext('New Pond0x auction detected', 'info', auctionData.id);
         
-        // Store auction data in Redis
+        // Store auction data
+        this.trackedAuctions.set(auctionData.id, {
+            ...auctionData,
+            isActive: true,
+            startedAt: Date.now(),
+            internalAuctionId: null
+        });
+        
+        // Store in Redis for other bots
         await redis.setex(
-            'current_auction',
+            `auction_${auctionData.id}`,
             auctionData.duration || 3600,
             JSON.stringify(auctionData)
         );
         
-        // Start our auction manager
-        await this.startInternalAuction(auctionData);
+        // Start internal auction with Pond0x auction ID
+        const internalAuctionId = await this.startInternalAuction(auctionData);
+        
+        // Update tracked auction with internal ID
+        const tracked = this.trackedAuctions.get(auctionData.id);
+        tracked.internalAuctionId = internalAuctionId;
         
         await this.sendAlert(
             `New auction started: ${auctionData.id} - Duration: ${auctionData.duration}s`,
-            'info'
+            'info',
+            { auctionId: auctionData.id, internalAuctionId }
         );
     }
     
     async startInternalAuction(auctionData) {
         try {
-            const tx = await this.auctionManager.startAuction(auctionData.duration);
-            await tx.wait();
+            // Use Pond0x auction ID as external auction ID
+            const tx = await this.auctionManager.startAuction(auctionData.id, auctionData.duration);
+            const receipt = await tx.wait();
             
-            logger.info(`Internal auction started: ${tx.hash}`);
+            // Extract internal auction ID from events
+            const auctionStartedEvent = receipt.events?.find(e => e.event === 'AuctionStarted');
+            const internalAuctionId = auctionStartedEvent?.args?.auctionId || auctionData.id;
+            
+            this.logWithContext(
+                `Internal auction started: ${tx.hash}`, 
+                'info', 
+                auctionData.id, 
+                null, 
+                'ethereum'
+            );
             
             // Notify other bots
             await redis.publish('auction_started', JSON.stringify({
-                auctionId: auctionData.id,
+                externalAuctionId: auctionData.id,
+                internalAuctionId: internalAuctionId,
                 duration: auctionData.duration,
-                txHash: tx.hash
+                txHash: tx.hash,
+                eligiblePools: auctionStartedEvent?.args?.eligiblePools || []
             }));
             
+            return internalAuctionId;
+            
         } catch (error) {
-            logger.error(`Failed to start internal auction: ${error.message}`);
-            await this.sendAlert(`Failed to start internal auction: ${error.message}`, 'error');
+            this.logWithContext(`Failed to start internal auction: ${error.message}`, 'error', auctionData.id);
+            await this.sendAlert(`Failed to start internal auction: ${error.message}`, 'error', { auctionId: auctionData.id });
+            throw error;
         }
     }
     
-    async handleAuctionEnd() {
-        logger.info('Pond0x auction ended');
+    async handleAuctionEnd(auctionId) {
+        this.logWithContext('Pond0x auction ended', 'info', auctionId);
         
-        // Clean up Redis
-        await redis.del('current_auction');
-        
-        // End internal auction
-        try {
-            const tx = await this.auctionManager.endAuction();
-            await tx.wait();
+        const tracked = this.trackedAuctions.get(auctionId);
+        if (tracked) {
+            tracked.isActive = false;
+            tracked.endedAt = Date.now();
             
-            logger.info(`Internal auction ended: ${tx.hash}`);
-            
-            // Notify other bots
-            await redis.publish('auction_ended', JSON.stringify({
-                txHash: tx.hash,
-                timestamp: Date.now()
-            }));
-            
-        } catch (error) {
-            logger.error(`Failed to end internal auction: ${error.message}`);
+            // End internal auction if it exists
+            if (tracked.internalAuctionId) {
+                try {
+                    const tx = await this.auctionManager.endAuction(tracked.internalAuctionId);
+                    await tx.wait();
+                    
+                    this.logWithContext(`Internal auction ended: ${tx.hash}`, 'info', auctionId);
+                } catch (error) {
+                    this.logWithContext(`Failed to end internal auction: ${error.message}`, 'error', auctionId);
+                }
+            }
         }
         
-        await this.sendAlert('Auction ended', 'info');
+        // Clean up Redis
+        await redis.del(`auction_${auctionId}`);
+        
+        // Notify other bots
+        await redis.publish('auction_ended', JSON.stringify({
+            externalAuctionId: auctionId,
+            internalAuctionId: tracked?.internalAuctionId,
+            timestamp: Date.now()
+        }));
+        
+        await this.sendAlert(`Auction ended: ${auctionId}`, 'info', { auctionId });
+    }
+    
+    async checkAuctionResults() {
+        // Check for auction results and prepare reward distribution
+        try {
+            const resultsResponse = await axios.get(
+                `${CONFIG.pond0x.baseUrl}${CONFIG.pond0x.resultsEndpoint}`,
+                {
+                    headers: { 'Authorization': `Bearer ${CONFIG.pond0x.apiKey}` }
+                }
+            );
+            
+            for (const result of resultsResponse.data.results || []) {
+                if (!this.trackedAuctions.has(result.auctionId)) continue;
+                
+                const tracked = this.trackedAuctions.get(result.auctionId);
+                if (!tracked.resultsProcessed) {
+                    await this.processAuctionResult(result);
+                    tracked.resultsProcessed = true;
+                }
+            }
+            
+        } catch (error) {
+            this.logWithContext(`Failed to check auction results: ${error.message}`, 'error');
+        }
+    }
+    
+    async processAuctionResult(result) {
+        this.logWithContext('Processing auction result', 'info', result.auctionId);
+        
+        // Store result data for reward processing
+        await redis.setex(
+            `auction_result_${result.auctionId}`,
+            86400, // 24 hours
+            JSON.stringify(result)
+        );
+        
+        // Notify reward distribution bot
+        await redis.publish('auction_result', JSON.stringify(result));
+        
+        this.logWithContext('Auction result processed', 'info', result.auctionId);
     }
 }
 
-// Pool Monitor Bot
+// Enhanced Pool Monitor Bot with Auction ID Tracking
 class PoolMonitorBot extends BaseBot {
     constructor() {
         super('PoolMonitorBot');
         this.trackedPools = new Map();
+        this.auctionPools = new Map(); // auctionId => poolIds
         this.lastBlockProcessed = 0;
     }
     
     async run() {
-        // Set up event listeners
         this.setupEventListeners();
         
         while (this.isRunning) {
             try {
                 await this.checkPoolStates();
                 await this.checkExpiredPools();
+                await this.monitorCrossChainEvents();
                 await this.sleep(CONFIG.monitoring.checkInterval);
             } catch (error) {
-                logger.error(`Pool monitoring error: ${error.message}`);
+                this.logWithContext(`Pool monitoring error: ${error.message}`, 'error');
                 await this.sleep(CONFIG.monitoring.checkInterval);
             }
         }
     }
     
     setupEventListeners() {
-        // Listen for pool creation events
-        this.poolManager.on('PoolCreated', async (poolId, creator, labelToken, goal, deadline, multisigWallet) => {
-            logger.info(`New pool created: ${poolId.toString()}`);
+        // Enhanced pool creation listener with cross-chain support
+        this.poolManager.on('PoolCreated', async (poolId, creator, labelToken, goal, deadline, ethMultisig, solMultisig) => {
+            this.logWithContext(`New pool created: ${poolId.toString()}`, 'info', null, poolId.toString());
             
             this.trackedPools.set(poolId.toString(), {
                 id: poolId.toString(),
@@ -344,48 +408,104 @@ class PoolMonitorBot extends BaseBot {
                 labelToken,
                 goal: goal.toString(),
                 deadline: deadline.toString(),
-                multisigWallet,
-                lastChecked: Date.now()
+                ethMultisig,
+                solMultisig,
+                lastChecked: Date.now(),
+                auctions: [] // Track which auctions this pool participated in
             });
             
-            await this.sendAlert(`New pool created: ${poolId.toString()} with goal ${ethers.utils.formatEther(goal)} PNDC`, 'info');
+            await this.sendAlert(
+                `New pool created: ${poolId.toString()} with goal ${ethers.utils.formatEther(goal)} PNDC`,
+                'info',
+                { poolId: poolId.toString(), goal: goal.toString() }
+            );
         });
         
-        // Listen for goal reached events
-        this.poolManager.on('GoalReached', async (poolId, totalAmount) => {
-            logger.info(`Pool ${poolId.toString()} reached goal: ${ethers.utils.formatEther(totalAmount)} PNDC`);
-            
-            const pool = this.trackedPools.get(poolId.toString());
-            if (pool) {
-                pool.goalReached = true;
-                pool.currentAmount = totalAmount.toString();
-            }
-            
-            await this.sendAlert(`Pool ${poolId.toString()} reached goal!`, 'info');
-        });
-        
-        // Listen for contribution events
-        this.poolManager.on('ContributionMade', async (poolId, contributor, amount, newTotal) => {
-            logger.info(`Contribution made to pool ${poolId.toString()}: ${ethers.utils.formatEther(amount)} PNDC`);
-            
-            const pool = this.trackedPools.get(poolId.toString());
-            if (pool) {
-                pool.currentAmount = newTotal.toString();
-                pool.lastActivity = Date.now();
-            }
-        });
-        
-        // Listen for pool wins
-        this.poolManager.on('PoolWon', async (poolId, bidAmount) => {
-            logger.info(`Pool ${poolId.toString()} won auction with ${ethers.utils.formatEther(bidAmount)} PNDC`);
+        // Enhanced pool won listener with auction ID
+        this.poolManager.on('PoolWon', async (poolId, auctionId, bidAmount) => {
+            this.logWithContext(
+                `Pool ${poolId.toString()} won auction ${auctionId.toString()}`,
+                'info',
+                auctionId.toString(),
+                poolId.toString()
+            );
             
             const pool = this.trackedPools.get(poolId.toString());
             if (pool) {
                 pool.hasWon = true;
+                pool.winningAuctionId = auctionId.toString();
                 pool.winAmount = bidAmount.toString();
+                if (!pool.auctions.includes(auctionId.toString())) {
+                    pool.auctions.push(auctionId.toString());
+                }
             }
             
-            await this.sendAlert(`Pool ${poolId.toString()} won auction!`, 'info');
+            // Track auction-pool relationship
+            if (!this.auctionPools.has(auctionId.toString())) {
+                this.auctionPools.set(auctionId.toString(), []);
+            }
+            this.auctionPools.get(auctionId.toString()).push(poolId.toString());
+            
+            await this.sendAlert(
+                `Pool ${poolId.toString()} won auction ${auctionId.toString()}!`,
+                'info',
+                { poolId: poolId.toString(), auctionId: auctionId.toString() }
+            );
+        });
+        
+        // Cross-chain reward initiation listener
+        this.poolManager.on('CrossChainRewardInitiated', async (poolId, auctionId, targetChain) => {
+            this.logWithContext(
+                `Cross-chain reward initiated for pool ${poolId.toString()}`,
+                'info',
+                auctionId.toString(),
+                poolId.toString(),
+                targetChain === 1 ? 'ethereum' : 'solana'
+            );
+            
+            // Store cross-chain reward info
+            await redis.setex(
+                `cross_chain_reward_${poolId}_${auctionId}`,
+                3600,
+                JSON.stringify({
+                    poolId: poolId.toString(),
+                    auctionId: auctionId.toString(),
+                    targetChain,
+                    timestamp: Date.now()
+                })
+            );
+        });
+        
+        // Enhanced rewards received listener with auction ID
+        this.poolManager.on('RewardsReceived', async (poolId, auctionId, rewardToken, amount, targetChain) => {
+            this.logWithContext(
+                `Rewards received for pool ${poolId.toString()} from auction ${auctionId.toString()}`,
+                'info',
+                auctionId.toString(),
+                poolId.toString(),
+                targetChain === 1 ? 'ethereum' : 'solana'
+            );
+            
+            const pool = this.trackedPools.get(poolId.toString());
+            if (pool) {
+                if (!pool.rewards) pool.rewards = {};
+                pool.rewards[auctionId.toString()] = {
+                    token: rewardToken,
+                    amount: amount.toString(),
+                    targetChain,
+                    received: true
+                };
+            }
+        });
+        
+        // Enhanced rewards distributed listener
+        this.poolManager.on('RewardsDistributed', async (poolId, auctionId, user, amount) => {
+            this.logWithContext(
+                `Rewards distributed to ${user} from pool ${poolId.toString()} auction ${auctionId.toString()}`,
+                'info',
+                auctionId.toString(),
+                poolId.toString()
+            );
         });
     }
     
@@ -394,6 +514,7 @@ class PoolMonitorBot extends BaseBot {
         
         for (const poolId of eligiblePools) {
             const poolInfo = await this.poolManager.getPoolInfo(poolId);
+            const multisigs = await this.poolManager.getPoolMultisigs(poolId);
             
             // Update tracked pool data
             const tracked = this.trackedPools.get(poolId.toString()) || {};
@@ -401,6 +522,9 @@ class PoolMonitorBot extends BaseBot {
             tracked.currentAmount = poolInfo.currentAmount.toString();
             tracked.goalMet = poolInfo.goalMet;
             tracked.hasWon = poolInfo.hasWon;
+            tracked.winningAuctionId = poolInfo.winningAuctionId.toString();
+            tracked.ethMultisig = multisigs.ethMultisig;
+            tracked.solMultisig = multisigs.solMultisig;
             
             this.trackedPools.set(poolId.toString(), tracked);
             
@@ -410,6 +534,31 @@ class PoolMonitorBot extends BaseBot {
                 3600,
                 JSON.stringify(tracked)
             );
+        }
+    }
+    
+    async monitorCrossChainEvents() {
+        // Monitor cross-chain reward events and coordinate between chains
+        try {
+            // Check for pending cross-chain rewards
+            const crossChainKeys = await redis.keys('cross_chain_reward_*');
+            
+            for (const key of crossChainKeys) {
+                const rewardInfo = JSON.parse(await redis.get(key));
+                const timeSinceInitiated = Date.now() - rewardInfo.timestamp;
+                
+                // Alert if cross-chain reward is taking too long
+                if (timeSinceInitiated > 300000) { // 5 minutes
+                    await this.sendAlert(
+                        `Cross-chain reward delayed: Pool ${rewardInfo.poolId}, Auction ${rewardInfo.auctionId}`,
+                        'warning',
+                        rewardInfo
+                    );
+                }
+            }
+            
+        } catch (error) {
+            this.logWithContext(`Cross-chain monitoring error: ${error.message}`, 'error');
         }
     }
     
@@ -425,10 +574,7 @@ class PoolMonitorBot extends BaseBot {
     
     async handleExpiredPool(poolId) {
         try {
-            logger.info(`Processing expired pool: ${poolId}`);
-            
-            // This would trigger the return of tokens to users
-            // In practice, this might require multisig approval
+            this.logWithContext(`Processing expired pool: ${poolId}`, 'info', null, poolId);
             
             const pool = this.trackedPools.get(poolId);
             if (pool) {
@@ -436,24 +582,24 @@ class PoolMonitorBot extends BaseBot {
                 pool.expired = true;
             }
             
-            await this.sendAlert(`Pool ${poolId} has expired`, 'warning');
+            await this.sendAlert(`Pool ${poolId} has expired`, 'warning', { poolId });
             
         } catch (error) {
-            logger.error(`Failed to process expired pool ${poolId}: ${error.message}`);
+            this.logWithContext(`Failed to process expired pool ${poolId}: ${error.message}`, 'error', null, poolId);
         }
     }
 }
 
-// Bidding Bot
+// Enhanced Bidding Bot with Multiple Auction Support
 class BiddingBot extends BaseBot {
     constructor() {
         super('BiddingBot');
-        this.isAuctionActive = false;
+        this.activeAuctions = new Map(); // auctionId => auction state
+        this.biddingStrategies = new Map(); // auctionId => strategy
         this.setupSubscriptions();
     }
     
     setupSubscriptions() {
-        // Subscribe to auction events
         const subscriber = redis.duplicate();
         
         subscriber.subscribe('auction_started', (message) => {
@@ -469,396 +615,947 @@ class BiddingBot extends BaseBot {
     
     async run() {
         while (this.isRunning) {
-            if (this.isAuctionActive) {
-                await this.checkBiddingOpportunity();
+            if (this.activeAuctions.size > 0) {
+                await this.checkBiddingOpportunities();
             }
             await this.sleep(5000); // Check every 5 seconds during auctions
         }
     }
     
     async handleAuctionStart(auctionData) {
-        logger.info('Auction started, enabling bidding bot');
-        this.isAuctionActive = true;
+        this.logWithContext('Auction started, enabling bidding', 'info', auctionData.externalAuctionId);
         
-        // Wait a moment for the blockchain to sync
+        this.activeAuctions.set(auctionData.externalAuctionId, {
+            externalId: auctionData.externalAuctionId,
+            internalId: auctionData.internalAuctionId,
+            duration: auctionData.duration,
+            eligiblePools: auctionData.eligiblePools,
+            startTime: Date.now(),
+            bidPlaced: false
+        });
+        
+        // Wait for blockchain sync
         await this.sleep(10000);
         
-        await this.executeBiddingStrategy();
+        await this.evaluateBiddingStrategy(auctionData.externalAuctionId);
     }
     
     async handleAuctionEnd(auctionData) {
-        logger.info('Auction ended, disabling bidding bot');
-        this.isAuctionActive = false;
+        this.logWithContext('Auction ended, disabling bidding', 'info', auctionData.externalAuctionId);
+        
+        const auction = this.activeAuctions.get(auctionData.externalAuctionId);
+        if (auction) {
+            auction.ended = true;
+            auction.endTime = Date.now();
+            
+            // Clean up after some time
+            setTimeout(() => {
+                this.activeAuctions.delete(auctionData.externalAuctionId);
+            }, 60000); // Keep for 1 minute for analysis
+        }
     }
     
-    async executeBiddingStrategy() {
+    async evaluateBiddingStrategy(auctionId) {
         try {
-            // Get current auction state
-            const auctionState = await this.auctionManager.getCurrentAuction();
+            const auction = this.activeAuctions.get(auctionId);
+            if (!auction || auction.bidPlaced) return;
+            
+            // Get current auction state from contract
+            const auctionState = await this.auctionManager.getAuction(auction.internalId);
             
             if (!auctionState.isActive) {
-                logger.info('No active auction found');
+                this.logWithContext('Auction not active on contract', 'info', auctionId);
                 return;
             }
             
-            // Check if we should bid
-            const shouldBid = await this.evaluateBiddingDecision(auctionState);
+            // Evaluate bidding decision
+            const shouldBid = await this.evaluateBiddingDecision(auction, auctionState);
             
             if (shouldBid) {
-                await this.placeBid();
+                await this.placeBid(auctionId, auction.internalId);
             }
             
         } catch (error) {
-            logger.error(`Bidding strategy error: ${error.message}`);
+            this.logWithContext(`Bidding strategy evaluation error: ${error.message}`, 'error', auctionId);
         }
     }
     
-    async evaluateBiddingDecision(auctionState) {
-        const eligiblePools = auctionState.eligiblePools;
-        
-        if (eligiblePools.length === 0) {
-            logger.info('No eligible pools for bidding');
+    async evaluateBiddingDecision(auction, auctionState) {
+        if (auctionState.eligiblePools.length === 0) {
+            this.logWithContext('No eligible pools for bidding', 'info', auction.externalId);
             return false;
         }
         
-        // Check if largest pool is significantly ahead
+        // Get pool information for decision making
         const poolInfos = await Promise.all(
-            eligiblePools.map(poolId => this.poolManager.getPoolInfo(poolId))
+            auctionState.eligiblePools.map(poolId => this.poolManager.getPoolInfo(poolId))
         );
         
-        // Sort by current amount
+        // Sort by current amount (descending)
         poolInfos.sort((a, b) => b.currentAmount.sub(a.currentAmount));
         
         const largestPool = poolInfos[0];
         const secondLargest = poolInfos[1];
         
-        // Only bid if largest pool has significant lead
+        // Only bid if largest pool has significant lead (>10%) or if there's only one pool
         if (secondLargest) {
             const leadPercentage = largestPool.currentAmount
                 .sub(secondLargest.currentAmount)
                 .mul(100)
                 .div(largestPool.currentAmount);
             
-            if (leadPercentage.lt(10)) { // Less than 10% lead
-                logger.info('Waiting for clearer leader before bidding');
+            if (leadPercentage.lt(10)) {
+                this.logWithContext('Waiting for clearer leader before bidding', 'info', auction.externalId);
                 return false;
             }
+        }
+        
+        // Check time constraints - bid in last 30% of auction duration
+        const timeElapsed = Date.now() - auction.startTime;
+        const timeRemaining = auction.duration * 1000 - timeElapsed;
+        const timeThreshold = auction.duration * 1000 * 0.3; // Last 30%
+        
+        if (timeRemaining > timeThreshold) {
+            this.logWithContext('Too early to bid, waiting for optimal timing', 'info', auction.externalId);
+            return false;
         }
         
         return true;
     }
     
-    async placeBid() {
+    async placeBid(externalAuctionId, internalAuctionId) {
         try {
-            logger.info('Placing bid for largest eligible pool');
+            const auction = this.activeAuctions.get(externalAuctionId);
+            if (auction.bidPlaced) return;
+            
+            this.logWithContext('Placing bid for eligible pools', 'info', externalAuctionId);
             
             const gasPrice = await this.provider.getGasPrice();
-            const tx = await this.auctionManager.placeBid({
+            const tx = await this.auctionManager.placeBid(internalAuctionId, {
                 gasPrice: gasPrice.mul(120).div(100), // 20% above current gas price
                 gasLimit: CONFIG.ethereum.gasLimit
             });
             
-            logger.info(`Bid placed: ${tx.hash}`);
+            this.logWithContext(`Bid placed: ${tx.hash}`, 'info', externalAuctionId);
+            auction.bidPlaced = true;
+            auction.bidTxHash = tx.hash;
             
             const receipt = await tx.wait();
             
             if (receipt.status === 1) {
-                logger.info(`Bid confirmed: ${tx.hash}`);
-                await this.sendAlert(`Bid successfully placed: ${tx.hash}`, 'info');
+                // Extract winning pools from events
+                const bidPlacedEvents = receipt.events?.filter(e => e.event === 'BidPlaced') || [];
+                const winningPools = bidPlacedEvents.map(e => e.args.poolId.toString());
+                
+                auction.winningPools = winningPools;
+                
+                this.logWithContext(
+                    `Bid confirmed: ${tx.hash}, Winning pools: ${winningPools.join(', ')}`,
+                    'info',
+                    externalAuctionId
+                );
+                
+                await this.sendAlert(
+                    `Bid successfully placed for auction ${externalAuctionId}: ${tx.hash}`,
+                    'info',
+                    { auctionId: externalAuctionId, txHash: tx.hash, winningPools }
+                );
             } else {
-                logger.error(`Bid failed: ${tx.hash}`);
-                await this.sendAlert(`Bid transaction failed: ${tx.hash}`, 'error');
+                this.logWithContext(`Bid transaction failed: ${tx.hash}`, 'error', externalAuctionId);
+                await this.sendAlert(`Bid transaction failed: ${tx.hash}`, 'error', { auctionId: externalAuctionId });
             }
             
         } catch (error) {
-            logger.error(`Failed to place bid: ${error.message}`);
-            await this.sendAlert(`Failed to place bid: ${error.message}`, 'error');
+            this.logWithContext(`Failed to place bid: ${error.message}`, 'error', externalAuctionId);
+            await this.sendAlert(`Failed to place bid for auction ${externalAuctionId}: ${error.message}`, 'error');
         }
     }
     
-    async checkBiddingOpportunity() {
-        try {
-            const auctionState = await this.auctionManager.getCurrentAuction();
+    async checkBiddingOpportunities() {
+        for (const [auctionId, auction] of this.activeAuctions) {
+            if (auction.ended || auction.bidPlaced) continue;
             
-            if (auctionState.isActive && !auctionState.hasWinner) {
-                // Check if conditions are right for bidding
-                const timeRemaining = auctionState.endTime - (Date.now() / 1000);
+            try {
+                const auctionState = await this.auctionManager.getAuction(auction.internalId);
                 
-                if (timeRemaining > 0 && timeRemaining < 300) { // Last 5 minutes
-                    await this.executeBiddingStrategy();
+                if (auctionState.isActive && !auctionState.winningPools.length) {
+                    // Check if conditions are right for bidding
+                    const timeRemaining = auctionState.endTime - (Date.now() / 1000);
+                    
+                    if (timeRemaining > 0 && timeRemaining < 300) { // Last 5 minutes
+                        await this.evaluateBiddingStrategy(auctionId);
+                    }
                 }
+                
+            } catch (error) {
+                this.logWithContext(`Error checking bidding opportunity: ${error.message}`, 'error', auctionId);
             }
-            
-        } catch (error) {
-            logger.error(`Error checking bidding opportunity: ${error.message}`);
         }
     }
 }
 
-// Reward Distribution Bot
+// Enhanced Reward Distribution Bot with Cross-Chain Support
 class RewardDistributionBot extends BaseBot {
     constructor() {
         super('RewardDistributionBot');
-        this.pendingRewards = new Map();
+        this.pendingRewards = new Map(); // auctionId => reward data
+        this.crossChainRewards = new Map(); // distributionId => cross-chain data
+        this.setupSubscriptions();
+    }
+    
+    setupSubscriptions() {
+        const subscriber = redis.duplicate();
+        
+        subscriber.subscribe('auction_result', (message) => {
+            const result = JSON.parse(message);
+            this.handleAuctionResult(result);
+        });
     }
     
     async run() {
-        // Listen for pool wins
-        this.poolManager.on('PoolWon', async (poolId, bidAmount) => {
-            await this.handlePoolWin(poolId, bidAmount);
+        // Listen for pool wins with auction IDs
+        this.poolManager.on('PoolWon', async (poolId, auctionId, bidAmount) => {
+            await this.handlePoolWin(poolId.toString(), auctionId.toString(), bidAmount.toString());
+        });
+        
+        // Listen for cross-chain reward events
+        this.poolManager.on('CrossChainRewardInitiated', async (poolId, auctionId, targetChain) => {
+            await this.handleCrossChainRewardInitiation(poolId.toString(), auctionId.toString(), targetChain);
         });
         
         while (this.isRunning) {
             await this.checkPendingRewards();
+            await this.processCrossChainRewards();
             await this.sleep(CONFIG.monitoring.checkInterval);
         }
     }
     
-    async handlePoolWin(poolId, bidAmount) {
-        logger.info(`Pool ${poolId.toString()} won, preparing for reward distribution`);
+    async handlePoolWin(poolId, auctionId, bidAmount) {
+        this.logWithContext(`Pool ${poolId} won auction ${auctionId}`, 'info', auctionId, poolId);
         
-        this.pendingRewards.set(poolId.toString(), {
-            poolId: poolId.toString(),
-            bidAmount: bidAmount.toString(),
+        const rewardKey = `${auctionId}_${poolId}`;
+        this.pendingRewards.set(rewardKey, {
+            poolId,
+            auctionId,
+            bidAmount,
             timestamp: Date.now(),
-            status: 'pending'
+            status: 'pending',
+            rewardsReceived: false
         });
         
-        // Simulate waiting for external auction rewards
-        setTimeout(() => {
-            this.simulateRewardReceipt(poolId.toString());
-        }, 60000); // 1 minute delay
-    }
-    
-    async simulateRewardReceipt(poolId) {
-        // This would be replaced with actual reward detection logic
-        const rewardAmount = ethers.utils.parseEther('1000'); // 1000 ETH as example
-        const rewardToken = '0x0000000000000000000000000000000000000000'; // ETH
+        // Store in Redis for persistence
+        await redis.setex(`pending_reward_${rewardKey}`, 3600, JSON.stringify({
+            poolId,
+            auctionId,
+            bidAmount,
+            timestamp: Date.now()
+        }));
         
-        await this.processReward(poolId, rewardToken, rewardAmount, false);
+        this.logWithContext(`Reward tracking initiated for pool ${poolId}, auction ${auctionId}`, 'info', auctionId, poolId);
     }
     
-    async processReward(poolId, rewardToken, amount, isSPLToken) {
+    async handleAuctionResult(auctionResult) {
+        this.logWithContext(`Processing auction result for ${auctionResult.auctionId}`, 'info', auctionResult.auctionId);
+        
+        // Get winning pools for this auction
         try {
-            logger.info(`Processing reward for pool ${poolId}: ${ethers.utils.formatEther(amount)} tokens`);
+            const winningPools = await this.poolManager.getAuctionWinners(auctionResult.auctionId);
             
+            for (const poolId of winningPools) {
+                await this.processRewardForPool(
+                    poolId.toString(),
+                    auctionResult.auctionId,
+                    auctionResult.rewards
+                );
+            }
+            
+        } catch (error) {
+            this.logWithContext(`Failed to process auction result: ${error.message}`, 'error', auctionResult.auctionId);
+        }
+    }
+    
+    async processRewardForPool(poolId, auctionId, rewardData) {
+        try {
+            this.logWithContext(`Processing reward for pool ${poolId}, auction ${auctionId}`, 'info', auctionId, poolId);
+            
+            // Determine target chain based on reward type and pool configuration
+            const multisigs = await this.poolManager.getPoolMultisigs(poolId);
+            const targetChain = this.determineTargetChain(rewardData, multisigs);
+            
+            // Process rewards through reward distributor
             const tx = await this.rewardDistributor.processRewards(
                 poolId,
-                rewardToken,
-                amount,
-                isSPLToken
+                auctionId,
+                rewardData.tokenAddress,
+                ethers.utils.parseEther(rewardData.amount.toString()),
+                rewardData.isSPL || false,
+                targetChain
             );
             
             await tx.wait();
             
-            logger.info(`Reward processed for pool ${poolId}: ${tx.hash}`);
+            this.logWithContext(`Reward processed for pool ${poolId}, auction ${auctionId}: ${tx.hash}`, 'info', auctionId, poolId);
             
-            const pending = this.pendingRewards.get(poolId);
+            // Update pending rewards
+            const rewardKey = `${auctionId}_${poolId}`;
+            const pending = this.pendingRewards.get(rewardKey);
             if (pending) {
                 pending.status = 'processed';
                 pending.txHash = tx.hash;
+                pending.targetChain = targetChain;
             }
             
-            await this.sendAlert(`Rewards distributed for pool ${poolId}`, 'info');
+            await this.sendAlert(
+                `Rewards processed for pool ${poolId}, auction ${auctionId}`,
+                'info',
+                { poolId, auctionId, txHash: tx.hash }
+            );
             
         } catch (error) {
-            logger.error(`Failed to process reward for pool ${poolId}: ${error.message}`);
-            await this.sendAlert(`Failed to process reward for pool ${poolId}: ${error.message}`, 'error');
+            this.logWithContext(`Failed to process reward: ${error.message}`, 'error', auctionId, poolId);
+            await this.sendAlert(`Failed to process reward for pool ${poolId}, auction ${auctionId}: ${error.message}`, 'error');
+        }
+    }
+    
+    determineTargetChain(rewardData, multisigs) {
+        // Logic to determine whether rewards should go to Ethereum or Solana
+        // Based on reward type, user preferences, gas costs, etc.
+        
+        if (rewardData.preferredChain) {
+            return rewardData.preferredChain === 'ethereum' ? 1 : 2;
+        }
+        
+        // Default: SPL tokens go to Solana, ERC-20 tokens stay on Ethereum
+        if (rewardData.isSPL) {
+            return 2; // Solana
+        } else {
+            return 1; // Ethereum
+        }
+    }
+    
+    async handleCrossChainRewardInitiation(poolId, auctionId, targetChain) {
+        this.logWithContext(
+            `Cross-chain reward initiated for pool ${poolId}, auction ${auctionId}`,
+            'info',
+            auctionId,
+            poolId,
+            targetChain === 1 ? 'ethereum' : 'solana'
+        );
+        
+        // Track cross-chain distribution
+        const distributionKey = `${auctionId}_${poolId}_${targetChain}`;
+        this.crossChainRewards.set(distributionKey, {
+            poolId,
+            auctionId,
+            targetChain,
+            status: 'initiated',
+            timestamp: Date.now()
+        });
+    }
+    
+    async processCrossChainRewards() {
+        for (const [key, crossChainReward] of this.crossChainRewards) {
+            if (crossChainReward.status === 'initiated') {
+                try {
+                    // Check if cross-chain distribution is complete
+                    const timeSinceInitiation = Date.now() - crossChainReward.timestamp;
+                    
+                    if (timeSinceInitiation > 600000) { // 10 minutes
+                        this.logWithContext(
+                            `Cross-chain reward taking too long: ${key}`,
+                            'warning',
+                            crossChainReward.auctionId,
+                            crossChainReward.poolId
+                        );
+                        
+                        await this.sendAlert(
+                            `Cross-chain reward delayed: Pool ${crossChainReward.poolId}, Auction ${crossChainReward.auctionId}`,
+                            'warning',
+                            crossChainReward
+                        );
+                    }
+                    
+                } catch (error) {
+                    this.logWithContext(`Cross-chain reward processing error: ${error.message}`, 'error');
+                }
+            }
         }
     }
     
     async checkPendingRewards() {
-        for (const [poolId, reward] of this.pendingRewards) {
+        for (const [rewardKey, reward] of this.pendingRewards) {
             if (reward.status === 'pending') {
                 const timeSinceWin = Date.now() - reward.timestamp;
                 
-                if (timeSinceWin > 300000) { // 5 minutes
-                    logger.warn(`Reward for pool ${poolId} still pending after 5 minutes`);
-                    await this.sendAlert(`Reward distribution delayed for pool ${poolId}`, 'warning');
+                // Alert if reward is pending too long
+                if (timeSinceWin > 300000 && !reward.alertSent) { // 5 minutes
+                    this.logWithContext(
+                        `Reward for pool ${reward.poolId}, auction ${reward.auctionId} still pending after 5 minutes`,
+                        'warning',
+                        reward.auctionId,
+                        reward.poolId
+                    );
+                    
+                    await this.sendAlert(
+                        `Reward distribution delayed for pool ${reward.poolId}, auction ${reward.auctionId}`,
+                        'warning',
+                        reward
+                    );
+                    
+                    reward.alertSent = true;
+                }
+                
+                // Check if we have auction results for this reward
+                const auctionResult = await redis.get(`auction_result_${reward.auctionId}`);
+                if (auctionResult && !reward.rewardsReceived) {
+                    const result = JSON.parse(auctionResult);
+                    await this.processRewardForPool(reward.poolId, reward.auctionId, result.rewards);
+                    reward.rewardsReceived = true;
                 }
             }
         }
     }
+    
+    async batchProcessRewards(rewardsData) {
+        try {
+            const poolIds = [];
+            const auctionIds = [];
+            const rewardTokens = [];
+            const amounts = [];
+            const isSPLTokens = [];
+            const targetChains = [];
+            
+            for (const reward of rewardsData) {
+                poolIds.push(reward.poolId);
+                auctionIds.push(reward.auctionId);
+                rewardTokens.push(reward.tokenAddress);
+                amounts.push(ethers.utils.parseEther(reward.amount.toString()));
+                isSPLTokens.push(reward.isSPL || false);
+                targetChains.push(reward.targetChain || 1);
+            }
+            
+            const tx = await this.rewardDistributor.batchProcessRewards(
+                poolIds,
+                auctionIds,
+                rewardTokens,
+                amounts,
+                isSPLTokens,
+                targetChains
+            );
+            
+            await tx.wait();
+            
+            this.logWithContext(`Batch rewards processed: ${tx.hash}`, 'info');
+            
+        } catch (error) {
+            this.logWithContext(`Batch reward processing failed: ${error.message}`, 'error');
+            throw error;
+        }
+    }
 }
 
-// Cross-Chain Bridge Bot
-class BridgeBot extends BaseBot {
+// Enhanced Cross-Chain Coordinator Bot
+class CrossChainCoordinatorBot extends BaseBot {
     constructor() {
-        super('BridgeBot');
-        this.pendingBridges = new Map();
+        super('CrossChainCoordinatorBot');
+        this.pendingDistributions = new Map();
+        this.chainStates = new Map();
+        this.bridgeOperations = new Map();
     }
     
     async run() {
-        // Listen for SPL token bridging events
-        this.rewardDistributor.on('SPLTokensBridged', async (splToken, amount, ethReceived) => {
-            await this.handleSPLBridge(splToken, amount, ethReceived);
+        // Monitor cross-chain events
+        this.crossChainRewardManager.on('RewardDistributionInitiated', async (distributionId, auctionId, poolId, targetChain) => {
+            await this.handleDistributionInitiation(distributionId, auctionId.toString(), poolId.toString(), targetChain);
+        });
+        
+        this.crossChainRewardManager.on('CrossChainMessageSent', async (messageId, targetChain, data) => {
+            await this.handleCrossChainMessage(messageId, targetChain, data);
+        });
+        
+        this.bridgeContract.on('CrossChainRewardBridged', async (auctionId, poolId, token, amount) => {
+            await this.handleBridgeOperation(auctionId.toString(), poolId.toString(), token, amount.toString());
         });
         
         while (this.isRunning) {
-            await this.checkBridgeStatus();
+            await this.coordinateCrossChainOperations();
+            await this.monitorBridgeOperations();
+            await this.syncChainStates();
             await this.sleep(CONFIG.monitoring.checkInterval);
         }
     }
     
-    async handleSPLBridge(splToken, amount, ethReceived) {
-        logger.info(`SPL tokens bridged: ${amount} -> ${ethReceived} ETH`);
+    async handleDistributionInitiation(distributionId, auctionId, poolId, targetChain) {
+        this.logWithContext(
+            `Cross-chain distribution initiated: ${distributionId}`,
+            'info',
+            auctionId,
+            poolId,
+            targetChain === 1 ? 'ethereum' : 'solana'
+        );
         
-        // Monitor bridge transaction
-        this.pendingBridges.set(`${splToken}-${Date.now()}`, {
-            splToken,
-            amount: amount.toString(),
-            ethReceived: ethReceived.toString(),
-            timestamp: Date.now(),
-            status: 'bridged'
+        this.pendingDistributions.set(distributionId, {
+            distributionId,
+            auctionId,
+            poolId,
+            targetChain,
+            status: 'initiated',
+            timestamp: Date.now()
+        });
+        
+        // Execute the distribution after a brief delay
+        setTimeout(() => {
+            this.executeCrossChainDistribution(distributionId);
+        }, 30000); // 30 second delay
+    }
+    
+    async executeCrossChainDistribution(distributionId) {
+        try {
+            const distribution = this.pendingDistributions.get(distributionId);
+            if (!distribution) return;
+            
+            this.logWithContext(
+                `Executing cross-chain distribution: ${distributionId}`,
+                'info',
+                distribution.auctionId,
+                distribution.poolId
+            );
+            
+            const tx = await this.crossChainRewardManager.executeCrossChainDistribution(distributionId);
+            await tx.wait();
+            
+            distribution.status = 'executed';
+            distribution.txHash = tx.hash;
+            
+            this.logWithContext(
+                `Cross-chain distribution executed: ${tx.hash}`,
+                'info',
+                distribution.auctionId,
+                distribution.poolId
+            );
+            
+        } catch (error) {
+            this.logWithContext(`Failed to execute cross-chain distribution: ${error.message}`, 'error');
+        }
+    }
+    
+    async handleCrossChainMessage(messageId, targetChain, data) {
+        this.logWithContext(
+            `Cross-chain message sent: ${messageId} to chain ${targetChain}`,
+            'info',
+            null,
+            null,
+            targetChain === 1 ? 'ethereum' : 'solana'
+        );
+        
+        // Track message for confirmation
+        this.bridgeOperations.set(messageId, {
+            messageId,
+            targetChain,
+            data,
+            status: 'sent',
+            timestamp: Date.now()
         });
     }
     
-    async checkBridgeStatus() {
-        // Monitor Solana network for incoming bridge requests
+    async handleBridgeOperation(auctionId, poolId, token, amount) {
+        this.logWithContext(
+            `Bridge operation completed for auction ${auctionId}, pool ${poolId}`,
+            'info',
+            auctionId,
+            poolId
+        );
+        
+        // Update bridge operation status
+        for (const [messageId, operation] of this.bridgeOperations) {
+            // Match bridge operation with pending messages
+            const decodedData = ethers.utils.defaultAbiCoder.decode(
+                ['bytes32', 'uint256', 'uint256', 'address', 'uint256'],
+                operation.data
+            );
+            
+            if (decodedData[1].toString() === auctionId && decodedData[2].toString() === poolId) {
+                operation.status = 'completed';
+                operation.completedAt = Date.now();
+                break;
+            }
+        }
+    }
+    
+    async coordinateCrossChainOperations() {
+        // Coordinate pending cross-chain operations
+        for (const [distributionId, distribution] of this.pendingDistributions) {
+            if (distribution.status === 'initiated') {
+                const timeSinceInitiation = Date.now() - distribution.timestamp;
+                
+                // Auto-execute after 2 minutes if not already executed
+                if (timeSinceInitiation > 120000 && distribution.status === 'initiated') {
+                    await this.executeCrossChainDistribution(distributionId);
+                }
+                
+                // Alert if taking too long
+                if (timeSinceInitiation > 600000) { // 10 minutes
+                    await this.sendAlert(
+                        `Cross-chain distribution delayed: ${distributionId}`,
+                        'warning',
+                        distribution
+                    );
+                }
+            }
+        }
+    }
+    
+    async monitorBridgeOperations() {
+        // Monitor bridge operations for completion
+        for (const [messageId, operation] of this.bridgeOperations) {
+            if (operation.status === 'sent') {
+                const timeSinceSent = Date.now() - operation.timestamp;
+                
+                // Alert if bridge operation is taking too long
+                if (timeSinceSent > 900000) { // 15 minutes
+                    await this.sendAlert(
+                        `Bridge operation delayed: ${messageId}`,
+                        'warning',
+                        operation
+                    );
+                }
+                
+                // Clean up old completed operations
+                if (timeSinceSent > 3600000) { // 1 hour
+                    this.bridgeOperations.delete(messageId);
+                }
+            }
+        }
+    }
+    
+    async syncChainStates() {
+        // Synchronize state between Ethereum and Solana
         try {
-            // This would implement actual Solana monitoring
-            // For now, it's a placeholder
+            // Get Ethereum state
+            const ethState = {
+                blockNumber: await this.provider.getBlockNumber(),
+                gasPrice: await this.provider.getGasPrice(),
+                timestamp: Date.now()
+            };
             
-            const recentTransactions = await this.getSolanaTransactions();
+            // Get Solana state
+            const solState = {
+                blockHeight: await this.solanaConnection.getBlockHeight(),
+                timestamp: Date.now()
+            };
             
-            for (const tx of recentTransactions) {
-                if (this.isBridgeTransaction(tx)) {
-                    await this.processBridgeRequest(tx);
+            this.chainStates.set('ethereum', ethState);
+            this.chainStates.set('solana', solState);
+            
+            // Store in Redis for other bots
+            await redis.setex('chain_state_ethereum', 300, JSON.stringify(ethState));
+            await redis.setex('chain_state_solana', 300, JSON.stringify(solState));
+            
+        } catch (error) {
+            this.logWithContext(`Chain state sync error: ${error.message}`, 'error');
+        }
+    }
+}
+
+// Enhanced Security Monitor Bot with Auction Tracking
+class SecurityMonitorBot extends BaseBot {
+    constructor() {
+        super('SecurityMonitorBot');
+        this.suspiciousActivities = new Map();
+        this.auctionActivities = new Map(); // Track per-auction activities
+        this.rateLimit = new Map();
+    }
+    
+    async run() {
+        // Monitor for suspicious activities with auction context
+        this.poolManager.on('ContributionMade', (poolId, contributor, amount) => {
+            this.checkContributionPattern(poolId.toString(), contributor, amount);
+        });
+        
+        this.poolManager.on('PoolCreated', (poolId, creator) => {
+            this.checkPoolCreationPattern(poolId.toString(), creator);
+        });
+        
+        this.poolManager.on('PoolWon', (poolId, auctionId, bidAmount) => {
+            this.trackAuctionWin(poolId.toString(), auctionId.toString(), bidAmount);
+        });
+        
+        while (this.isRunning) {
+            await this.performSecurityChecks();
+            await this.analyzeAuctionPatterns();
+            await this.checkCrossChainSecurity();
+            await this.sleep(CONFIG.monitoring.checkInterval);
+        }
+    }
+    
+    async trackAuctionWin(poolId, auctionId, bidAmount) {
+        if (!this.auctionActivities.has(auctionId)) {
+            this.auctionActivities.set(auctionId, {
+                winners: [],
+                totalAmount: ethers.BigNumber.from(0),
+                timestamp: Date.now()
+            });
+        }
+        
+        const auctionActivity = this.auctionActivities.get(auctionId);
+        auctionActivity.winners.push(poolId);
+        auctionActivity.totalAmount = auctionActivity.totalAmount.add(bidAmount);
+        
+        // Check for suspicious auction patterns
+        if (auctionActivity.winners.length > 3) {
+            await this.flagSuspiciousActivity(
+                auctionId,
+                'multiple_winners_single_auction',
+                { winnerCount: auctionActivity.winners.length, auctionId }
+            );
+        }
+    }
+    
+    async analyzeAuctionPatterns() {
+        // Analyze patterns across auctions
+        for (const [auctionId, activity] of this.auctionActivities) {
+            const age = Date.now() - activity.timestamp;
+            
+            // Clean up old auction data
+            if (age > 86400000) { // 24 hours
+                this.auctionActivities.delete(auctionId);
+                continue;
+            }
+            
+            // Analyze for manipulation patterns
+            if (activity.winners.length > 1) {
+                // Check if same addresses are winning multiple auctions
+                await this.checkWinnerPatterns(auctionId, activity);
+            }
+        }
+    }
+    
+    async checkWinnerPatterns(auctionId, activity) {
+        // This would implement sophisticated pattern analysis
+        // to detect potential manipulation across auctions
+        
+        const recentWinners = new Set();
+        const recentAuctions = Array.from(this.auctionActivities.entries())
+            .filter(([id, data]) => Date.now() - data.timestamp < 3600000) // Last hour
+            .map(([id, data]) => ({ id, winners: data.winners }));
+        
+        for (const auction of recentAuctions) {
+            for (const winner of auction.winners) {
+                if (recentWinners.has(winner)) {
+                    await this.flagSuspiciousActivity(
+                        winner,
+                        'frequent_auction_winner',
+                        { 
+                            winnerAddress: winner,
+                            auctionCount: recentAuctions.filter(a => a.winners.includes(winner)).length
+                        }
+                    );
+                }
+                recentWinners.add(winner);
+            }
+        }
+    }
+    
+    async checkCrossChainSecurity() {
+        // Monitor cross-chain operations for security issues
+        try {
+            const crossChainKeys = await redis.keys('cross_chain_reward_*');
+            
+            for (const key of crossChainKeys) {
+                const rewardInfo = JSON.parse(await redis.get(key));
+                
+                // Check for suspicious cross-chain patterns
+                if (rewardInfo.targetChain && rewardInfo.auctionId) {
+                    await this.validateCrossChainOperation(rewardInfo);
                 }
             }
             
         } catch (error) {
-            logger.error(`Bridge monitoring error: ${error.message}`);
+            this.logWithContext(`Cross-chain security check error: ${error.message}`, 'error');
         }
     }
     
-    async getSolanaTransactions() {
-        // Placeholder for Solana transaction monitoring
-        return [];
-    }
-    
-    isBridgeTransaction(tx) {
-        // Check if transaction is a bridge request
-        return false;
-    }
-    
-    async processBridgeRequest(tx) {
-        // Process incoming bridge request
-        logger.info(`Processing bridge request: ${tx.signature}`);
-    }
-}
-
-// Health Monitor Bot
-class HealthMonitorBot extends BaseBot {
-    constructor() {
-        super('HealthMonitorBot');
-        this.healthChecks = new Map();
-    }
-    
-    async run() {
-        while (this.isRunning) {
-            await this.performHealthChecks();
-            await this.sleep(CONFIG.monitoring.checkInterval);
-        }
-    }
-    
-    async performHealthChecks() {
-        const checks = [
-            this.checkEthereumConnection(),
-            this.checkSolanaConnection(),
-            this.checkContractHealth(),
-            this.checkRedisConnection(),
-            this.checkExternalAPIs()
-        ];
+    async validateCrossChainOperation(rewardInfo) {
+        // Validate cross-chain operations for security
+        const { poolId, auctionId, targetChain } = rewardInfo;
         
-        const results = await Promise.allSettled(checks);
-        
-        results.forEach((result, index) => {
-            const checkName = ['ethereum', 'solana', 'contracts', 'redis', 'apis'][index];
+        // Check if auction actually exists and pool won
+        try {
+            const auctionWinners = await this.poolManager.getAuctionWinners(auctionId);
+            const poolWon = auctionWinners.some(winner => winner.toString() === poolId);
             
-            if (result.status === 'rejected') {
-                logger.error(`Health check failed for ${checkName}: ${result.reason.message}`);
-                this.sendAlert(`Health check failed for ${checkName}`, 'error');
-            } else {
-                this.healthChecks.set(checkName, {
-                    status: 'healthy',
-                    lastCheck: Date.now(),
-                    details: result.value
-                });
+            if (!poolWon) {
+                await this.flagSuspiciousActivity(
+                    `${auctionId}_${poolId}`,
+                    'invalid_cross_chain_reward',
+                    { poolId, auctionId, targetChain }
+                );
             }
+            
+        } catch (error) {
+            this.logWithContext(`Cross-chain validation error: ${error.message}`, 'error');
+        }
+    }
+    
+    async flagSuspiciousActivity(identifier, type, details) {
+        const key = `${identifier}-${type}`;
+        
+        if (this.suspiciousActivities.has(key)) {
+            return; // Already flagged
+        }
+        
+        this.suspiciousActivities.set(key, {
+            identifier,
+            type,
+            details,
+            timestamp: Date.now(),
+            status: 'flagged'
         });
+        
+        this.logWithContext(`Suspicious activity detected: ${type} for ${identifier}`, 'warning');
+        await this.sendAlert(`Suspicious activity: ${type} for ${identifier}`, 'warning', details);
+        
+        // Store in Redis for investigation
+        await redis.setex(
+            `suspicious_${key}`,
+            86400, // 24 hours
+            JSON.stringify({
+                identifier,
+                type,
+                details,
+                timestamp: Date.now()
+            })
+        );
     }
     
-    async checkEthereumConnection() {
-        const blockNumber = await this.provider.getBlockNumber();
-        const balance = await this.provider.getBalance(this.wallet.address);
-        
-        return {
-            blockNumber,
-            balance: balance.toString(),
-            walletAddress: this.wallet.address
-        };
+    async performSecurityChecks() {
+        await Promise.all([
+            this.checkContractBalances(),
+            this.checkUnusualGasUsage(),
+            this.monitorLargeTransactions(),
+            this.validateAuctionIntegrity()
+        ]);
     }
     
-    async checkSolanaConnection() {
-        const blockHeight = await this.solanaConnection.getBlockHeight();
-        
-        return {
-            blockHeight,
-            endpoint: CONFIG.solana.rpcUrl
-        };
+    async checkContractBalances() {
+        try {
+            const contracts = [
+                { name: 'PoolManager', address: CONFIG.contracts.poolManager },
+                { name: 'AuctionManager', address: CONFIG.contracts.auctionManager },
+                { name: 'RewardDistributor', address: CONFIG.contracts.rewardDistributor },
+                { name: 'CrossChainRewardManager', address: CONFIG.contracts.crossChainRewardManager }
+            ];
+            
+            for (const contract of contracts) {
+                const balance = await this.provider.getBalance(contract.address);
+                const balanceEth = ethers.utils.formatEther(balance);
+                
+                // Alert if contract balance is unexpectedly high
+                if (parseFloat(balanceEth) > 10) { // More than 10 ETH
+                    await this.sendAlert(
+                        `High ${contract.name} balance detected: ${balanceEth} ETH`,
+                        'warning',
+                        { contract: contract.name, balance: balanceEth }
+                    );
+                }
+            }
+            
+        } catch (error) {
+            this.logWithContext(`Contract balance check error: ${error.message}`, 'error');
+        }
     }
     
-    async checkContractHealth() {
-        const poolCount = await this.poolManager.nextPoolId();
-        const auctionState = await this.auctionManager.getCurrentAuction();
-        
-        return {
-            poolCount: poolCount.toString(),
-            auctionActive: auctionState.isActive
-        };
+    async validateAuctionIntegrity() {
+        // Validate auction integrity across multiple auctions
+        try {
+            const activeAuctions = await this.auctionManager.getActiveAuctions();
+            
+            for (const auctionId of activeAuctions) {
+                const auctionState = await this.auctionManager.getAuction(auctionId);
+                
+                // Validate auction state consistency
+                if (auctionState.isActive && auctionState.endTime < Date.now() / 1000) {
+                    await this.sendAlert(
+                        `Auction ${auctionId.toString()} is active but past end time`,
+                        'warning',
+                        { auctionId: auctionId.toString() }
+                    );
+                }
+                
+                // Validate eligible pools
+                if (auctionState.eligiblePools.length === 0 && auctionState.isActive) {
+                    await this.sendAlert(
+                        `Active auction ${auctionId.toString()} has no eligible pools`,
+                        'warning',
+                        { auctionId: auctionId.toString() }
+                    );
+                }
+            }
+            
+        } catch (error) {
+            this.logWithContext(`Auction integrity check error: ${error.message}`, 'error');
+        }
     }
     
-    async checkRedisConnection() {
-        await redis.ping();
-        
-        return {
-            status: 'connected',
-            host: CONFIG.redis.host,
-            port: CONFIG.redis.port
-        };
+    async checkUnusualGasUsage() {
+        // Monitor for unusual gas usage patterns that might indicate attacks
+        try {
+            const recentBlocks = [];
+            const currentBlock = await this.provider.getBlockNumber();
+            
+            for (let i = 0; i < 5; i++) {
+                const block = await this.provider.getBlock(currentBlock - i);
+                recentBlocks.push(block);
+            }
+            
+            const avgGasUsed = recentBlocks.reduce((sum, block) => 
+                sum + block.gasUsed.toNumber(), 0) / recentBlocks.length;
+            
+            if (avgGasUsed > 15000000) { // 15M gas average - unusually high
+                await this.sendAlert(
+                    `High average gas usage detected: ${avgGasUsed}`,
+                    'warning',
+                    { avgGasUsed }
+                );
+            }
+            
+        } catch (error) {
+            this.logWithContext(`Gas usage check error: ${error.message}`, 'error');
+        }
     }
     
-    async checkExternalAPIs() {
-        const response = await axios.get(`${CONFIG.pond0x.baseUrl}/api/health`);
+    async monitorLargeTransactions() {
+        // Monitor for unusually large contributions that might indicate manipulation
+        const largeTxThreshold = ethers.utils.parseEther('500000000'); // 500M PNDC
         
-        return {
-            pond0x: response.status === 200,
-            responseTime: response.headers['response-time']
-        };
+        // This would be implemented with event filtering to catch large contributions in real-time
+        // For now, we'll check recent contributions periodically
     }
 }
 
-// Main Bot Manager
+// Main Bot Manager with Enhanced Coordination
 class BotManager {
     constructor() {
         this.bots = new Map();
         this.isRunning = false;
+        this.coordinationInterval = null;
     }
     
     async initialize() {
         // Initialize Redis
         await redis.connect();
         
-        // Create and register bots
+        // Create and register enhanced bots
         this.registerBot('pond0x', new Pond0xAuctionBot());
         this.registerBot('poolMonitor', new PoolMonitorBot());
         this.registerBot('bidding', new BiddingBot());
         this.registerBot('rewards', new RewardDistributionBot());
-        this.registerBot('bridge', new BridgeBot());
+        this.registerBot('crossChain', new CrossChainCoordinatorBot());
+        this.registerBot('security', new SecurityMonitorBot());
         this.registerBot('health', new HealthMonitorBot());
+        this.registerBot('analytics', new AnalyticsBot());
         
-        logger.info('Bot manager initialized');
+        logger.info('Enhanced bot manager initialized with auction ID support');
     }
     
     registerBot(name, bot) {
@@ -868,6 +1565,11 @@ class BotManager {
     
     async startAll() {
         this.isRunning = true;
+        
+        // Start coordination interval
+        this.coordinationInterval = setInterval(() => {
+            this.coordinateBots();
+        }, 30000); // Every 30 seconds
         
         for (const [name, bot] of this.bots) {
             try {
@@ -882,6 +1584,10 @@ class BotManager {
     async stopAll() {
         this.isRunning = false;
         
+        if (this.coordinationInterval) {
+            clearInterval(this.coordinationInterval);
+        }
+        
         for (const [name, bot] of this.bots) {
             try {
                 await bot.stop();
@@ -894,717 +1600,107 @@ class BotManager {
         await redis.disconnect();
     }
     
-    getBot(name) {
-        return this.bots.get(name);
-    }
-    
-    getBotStatus() {
-        const status = {};
-        
-        for (const [name, bot] of this.bots) {
-            status[name] = {
-                isRunning: bot.isRunning,
-                retryCount: bot.retryCount,
-                name: bot.name
-            };
-        }
-        
-        return status;
-    }
-}
+    // PNDC Bot System - Enhanced for Multiple Auctions & Cross-Chain Support
+// Updated to handle auction IDs and cross-chain reward distribution
 
-// Configuration Management
-class ConfigManager {
-    constructor() {
-        this.config = { ...CONFIG };
-        this.watchers = new Map();
-    }
-    
-    get(key) {
-        return this.getNestedValue(this.config, key);
-    }
-    
-    set(key, value) {
-        this.setNestedValue(this.config, key, value);
-        this.notifyWatchers(key, value);
-    }
-    
-    watch(key, callback) {
-        if (!this.watchers.has(key)) {
-            this.watchers.set(key, []);
-        }
-        this.watchers.get(key).push(callback);
-    }
-    
-    notifyWatchers(key, value) {
-        const callbacks = this.watchers.get(key) || [];
-        callbacks.forEach(callback => {
-            try {
-                callback(value, key);
-            } catch (error) {
-                logger.error(`Config watcher error: ${error.message}`);
-            }
-        });
-    }
-    
-    getNestedValue(obj, key) {
-        return key.split('.').reduce((o, k) => (o || {})[k], obj);
-    }
-    
-    setNestedValue(obj, key, value) {
-        const keys = key.split('.');
-        const lastKey = keys.pop();
-        const target = keys.reduce((o, k) => o[k] = o[k] || {}, obj);
-        target[lastKey] = value;
-    }
-    
-    async loadFromEnvironment() {
-        // Override config with environment variables
-        const envMappings = {
-            'ETH_RPC_URL': 'ethereum.rpcUrl',
-            'ETH_PRIVATE_KEY': 'ethereum.privateKey',
-            'SOLANA_RPC_URL': 'solana.rpcUrl',
-            'POOL_MANAGER_ADDRESS': 'contracts.poolManager',
-            'AUCTION_MANAGER_ADDRESS': 'contracts.auctionManager',
-            'POND0X_API_KEY': 'pond0x.apiKey',
-            'REDIS_HOST': 'redis.host',
-            'ALERT_WEBHOOK_URL': 'monitoring.alertWebhook'
-        };
-        
-        for (const [envVar, configKey] of Object.entries(envMappings)) {
-            if (process.env[envVar]) {
-                this.set(configKey, process.env[envVar]);
-            }
-        }
-    }
-    
-    async saveToFile(filename) {
-        const fs = require('fs').promises;
-        await fs.writeFile(filename, JSON.stringify(this.config, null, 2));
-    }
-    
-    async loadFromFile(filename) {
-        const fs = require('fs').promises;
-        try {
-            const data = await fs.readFile(filename, 'utf8');
-            this.config = { ...this.config, ...JSON.parse(data) };
-        } catch (error) {
-            logger.warn(`Could not load config from ${filename}: ${error.message}`);
-        }
-    }
-}
+const Web3 = require('web3');
+const { ethers } = require('ethers');
+const axios = require('axios');
+const cron = require('node-cron');
+const winston = require('winston');
+const Redis = require('redis');
+const { Connection, PublicKey, Keypair } = require('@solana/web3.js');
 
-// Database Layer for Persistent Storage
-class DatabaseManager {
-    constructor() {
-        this.db = null; // Would be initialized with your preferred DB
-    }
-    
-    async initialize() {
-        // Initialize database connection (PostgreSQL, MongoDB, etc.)
-        // This is a placeholder implementation
-        logger.info('Database manager initialized');
-    }
-    
-    async savePoolData(poolData) {
-        // Save pool information
-        const query = `
-            INSERT INTO pools (id, creator, label_token, goal, deadline, current_amount, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (id) DO UPDATE SET
-                current_amount = $6,
-                status = $7,
-                updated_at = NOW()
-        `;
-        
-        // Execute query with poolData
-        logger.info(`Saved pool data: ${poolData.id}`);
-    }
-    
-    async saveAuctionData(auctionData) {
-        // Save auction information
-        const query = `
-            INSERT INTO auctions (id, start_time, end_time, winning_pool, status)
-            VALUES ($1, $2, $3, $4, $5)
-        `;
-        
-        logger.info(`Saved auction data: ${auctionData.id}`);
-    }
-    
-    async saveTransactionData(txData) {
-        // Save transaction information
-        const query = `
-            INSERT INTO transactions (hash, type, pool_id, amount, status, block_number)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        `;
-        
-        logger.info(`Saved transaction data: ${txData.hash}`);
-    }
-    
-    async getPoolHistory(poolId) {
-        // Get pool transaction history
-        const query = `
-            SELECT * FROM transactions 
-            WHERE pool_id = $1 
-            ORDER BY block_number DESC
-        `;
-        
-        // Return transaction history
-        return [];
-    }
-    
-    async getSystemStats() {
-        // Get system-wide statistics
-        const queries = {
-            totalPools: 'SELECT COUNT(*) FROM pools',
-            totalValueLocked: 'SELECT SUM(current_amount) FROM pools WHERE status = \'active\'',
-            totalAuctions: 'SELECT COUNT(*) FROM auctions',
-            successfulAuctions: 'SELECT COUNT(*) FROM auctions WHERE status = \'completed\''
-        };
-        
-        // Execute queries and return stats
-        return {
-            totalPools: 0,
-            totalValueLocked: '0',
-            totalAuctions: 0,
-            successfulAuctions: 0
-        };
-    }
-}
-
-// Advanced Analytics Bot
-class AnalyticsBot extends BaseBot {
-    constructor() {
-        super('AnalyticsBot');
-        this.metrics = new Map();
-        this.dbManager = new DatabaseManager();
-    }
-    
-    async run() {
-        await this.dbManager.initialize();
-        
-        // Set up periodic analytics tasks
-        cron.schedule('*/5 * * * *', () => this.collectMetrics()); // Every 5 minutes
-        cron.schedule('0 * * * *', () => this.generateHourlyReport()); // Every hour
-        cron.schedule('0 0 * * *', () => this.generateDailyReport()); // Daily at midnight
-        
-        while (this.isRunning) {
-            await this.monitorSystemPerformance();
-            await this.sleep(CONFIG.monitoring.checkInterval);
+// Enhanced Configuration with Cross-Chain Support
+const CONFIG = {
+    ethereum: {
+        rpcUrl: process.env.ETH_RPC_URL || 'https://mainnet.infura.io/v3/YOUR_KEY',
+        privateKey: process.env.ETH_PRIVATE_KEY,
+        gasPrice: process.env.GAS_PRICE || '20000000000',
+        gasLimit: process.env.GAS_LIMIT || '500000'
+    },
+    solana: {
+        rpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+        privateKey: process.env.SOLANA_PRIVATE_KEY,
+        programId: process.env.SOLANA_PROGRAM_ID
+    },
+    contracts: {
+        poolManager: process.env.POOL_MANAGER_ADDRESS,
+        auctionManager: process.env.AUCTION_MANAGER_ADDRESS,
+        rewardDistributor: process.env.REWARD_DISTRIBUTOR_ADDRESS,
+        crossChainRewardManager: process.env.CROSS_CHAIN_REWARD_MANAGER_ADDRESS,
+        bridgeContract: process.env.BRIDGE_CONTRACT_ADDRESS,
+        multisigManager: process.env.MULTISIG_MANAGER_ADDRESS,
+        pndcToken: process.env.PNDC_TOKEN_ADDRESS
+    },
+    pond0x: {
+        baseUrl: 'https://pond0x.com',
+        auctionEndpoint: '/mining/bid',
+        apiKey: process.env.POND0X_API_KEY,
+        statusEndpoint: '/api/auction/status',
+        resultsEndpoint: '/api/auction/results'
+    },
+    crossChain: {
+        supportedChains: ['ethereum', 'solana'],
+        bridgeContracts: {
+            ethereum: process.env.ETH_BRIDGE_ADDRESS,
+            solana: process.env.SOL_BRIDGE_ADDRESS
+        },
+        multisigValidation: {
+            ethereum: { threshold: 2, timeout: 3600 },
+            solana: { threshold: 2, timeout: 3600 }
+        },
+        chainIds: {
+            ethereum: 1,
+            solana: 2
         }
+    },
+    redis: {
+        host: process.env.REDIS_HOST || 'localhost',
+        port: process.env.REDIS_PORT || 6379,
+        password: process.env.REDIS_PASSWORD
+    },
+    monitoring: {
+        checkInterval: 15000, // 15 seconds for auction monitoring
+        maxRetries: 3,
+        alertWebhook: process.env.ALERT_WEBHOOK_URL
     }
-    
-    async collectMetrics() {
-        try {
-            const metrics = {
-                timestamp: Date.now(),
-                pools: await this.getPoolMetrics(),
-                system: await this.getSystemMetrics(),
-                performance: await this.getPerformanceMetrics()
-            };
-            
-            // Store in Redis for real-time access
-            await redis.setex('current_metrics', 300, JSON.stringify(metrics));
-            
-            // Store in database for historical analysis
-            await this.dbManager.saveMetrics(metrics);
-            
-            logger.info('Metrics collected successfully');
-            
-        } catch (error) {
-            logger.error(`Failed to collect metrics: ${error.message}`);
-        }
-    }
-    
-    async getPoolMetrics() {
-        const eligiblePools = await this.poolManager.getEligiblePools();
-        let totalValue = ethers.BigNumber.from(0);
-        let goalMetPools = 0;
-        
-        for (const poolId of eligiblePools) {
-            const poolInfo = await this.poolManager.getPoolInfo(poolId);
-            totalValue = totalValue.add(poolInfo.currentAmount);
-            
-            if (poolInfo.goalMet) {
-                goalMetPools++;
-            }
-        }
-        
-        return {
-            totalPools: eligiblePools.length,
-            totalValueLocked: totalValue.toString(),
-            goalMetPools,
-            averagePoolSize: eligiblePools.length > 0 ? 
-                totalValue.div(eligiblePools.length).toString() : '0'
-        };
-    }
-    
-    async getSystemMetrics() {
-        const auctionState = await this.auctionManager.getCurrentAuction();
-        const blockNumber = await this.provider.getBlockNumber();
-        
-        return {
-            currentBlock: blockNumber,
-            auctionActive: auctionState.isActive,
-            gasPrice: (await this.provider.getGasPrice()).toString(),
-            networkStatus: 'healthy'
-        };
-    }
-    
-    async getPerformanceMetrics() {
-        const startTime = Date.now();
-        
-        // Test contract call performance
-        await this.poolManager.nextPoolId();
-        const contractCallTime = Date.now() - startTime;
-        
-        // Test Redis performance
-        const redisStartTime = Date.now();
-        await redis.ping();
-        const redisCallTime = Date.now() - redisStartTime;
-        
-        return {
-            contractCallLatency: contractCallTime,
-            redisLatency: redisCallTime,
-            memoryUsage: process.memoryUsage(),
-            uptime: process.uptime()
-        };
-    }
-    
-    async generateHourlyReport() {
-        const metrics = await this.dbManager.getHourlyMetrics();
-        
-        const report = {
-            timestamp: Date.now(),
-            period: 'hourly',
-            poolActivity: metrics.poolActivity,
-            transactionVolume: metrics.transactionVolume,
-            systemHealth: metrics.systemHealth,
-            alerts: metrics.alerts
-        };
-        
-        // Send to monitoring systems
-        await this.sendAlert(`Hourly Report: ${JSON.stringify(report)}`, 'info');
-        
-        logger.info('Hourly report generated');
-    }
-    
-    async generateDailyReport() {
-        const metrics = await this.dbManager.getDailyMetrics();
-        
-        const report = {
-            timestamp: Date.now(),
-            period: 'daily',
-            summary: {
-                newPools: metrics.newPools,
-                completedAuctions: metrics.completedAuctions,
-                totalRewards: metrics.totalRewards,
-                activeUsers: metrics.activeUsers
-            },
-            trends: await this.calculateTrends(metrics),
-            recommendations: await this.generateRecommendations(metrics)
-        };
-        
-        // Store detailed report
-        await this.dbManager.saveDailyReport(report);
-        
-        // Send summary alert
-        await this.sendAlert(`Daily Summary: ${report.summary.newPools} new pools, ${report.summary.completedAuctions} auctions`, 'info');
-        
-        logger.info('Daily report generated');
-    }
-    
-    async calculateTrends(metrics) {
-        // Calculate 7-day trends
-        return {
-            poolGrowth: '5%',
-            volumeChange: '12%',
-            userGrowth: '8%'
-        };
-    }
-    
-    async generateRecommendations(metrics) {
-        const recommendations = [];
-        
-        if (metrics.avgPoolSize < ethers.utils.parseEther('100000000')) { // Less than 100M
-            recommendations.push('Consider marketing campaigns to increase pool participation');
-        }
-        
-        if (metrics.failedTransactions > 10) {
-            recommendations.push('Investigate gas optimization opportunities');
-        }
-        
-        return recommendations;
-    }
-    
-    async monitorSystemPerformance() {
-        const metrics = await this.getPerformanceMetrics();
-        
-        // Alert on high latency
-        if (metrics.contractCallLatency > 5000) { // 5 seconds
-            await this.sendAlert(`High contract call latency: ${metrics.contractCallLatency}ms`, 'warning');
-        }
-        
-        // Alert on high memory usage
-        const memoryUsageMB = metrics.memoryUsage.heapUsed / 1024 / 1024;
-        if (memoryUsageMB > 500) { // 500MB
-            await this.sendAlert(`High memory usage: ${memoryUsageMB.toFixed(2)}MB`, 'warning');
-        }
-    }
-}
-
-// Security Monitor Bot
-class SecurityMonitorBot extends BaseBot {
-    constructor() {
-        super('SecurityMonitorBot');
-        this.suspiciousActivities = new Map();
-        this.rateLimit = new Map();
-    }
-    
-    async run() {
-        // Monitor for suspicious activities
-        this.poolManager.on('ContributionMade', (poolId, contributor, amount) => {
-            this.checkContributionPattern(poolId, contributor, amount);
-        });
-        
-        this.poolManager.on('PoolCreated', (poolId, creator) => {
-            this.checkPoolCreationPattern(poolId, creator);
-        });
-        
-        while (this.isRunning) {
-            await this.performSecurityChecks();
-            await this.sleep(CONFIG.monitoring.checkInterval);
-        }
-    }
-    
-    async checkContributionPattern(poolId, contributor, amount) {
-        const key = `${contributor}-contributions`;
-        const now = Date.now();
-        
-        // Get recent contributions
-        let contributions = this.rateLimit.get(key) || [];
-        contributions = contributions.filter(c => now - c.timestamp < 3600000); // Last hour
-        
-        contributions.push({
-            poolId: poolId.toString(),
-            amount: amount.toString(),
-            timestamp: now
-        });
-        
-        this.rateLimit.set(key, contributions);
-        
-        // Check for suspicious patterns
-        if (contributions.length > 10) { // More than 10 contributions per hour
-            await this.flagSuspiciousActivity(contributor, 'high_frequency_contributions', {
-                count: contributions.length,
-                totalAmount: contributions.reduce((sum, c) => sum + parseInt(c.amount), 0)
-            });
-        }
-        
-        // Check for round number patterns (potential bot behavior)
-        const isRoundNumber = amount.toString().endsWith('000000000000000000'); // Ends with 18 zeros
-        if (isRoundNumber && contributions.filter(c => c.amount.endsWith('000000000000000000')).length > 3) {
-            await this.flagSuspiciousActivity(contributor, 'round_number_pattern', {
-                count: contributions.length
-            });
-        }
-    }
-    
-    async checkPoolCreationPattern(poolId, creator) {
-        const key = `${creator}-pools`;
-        const now = Date.now();
-        
-        let pools = this.rateLimit.get(key) || [];
-        pools = pools.filter(p => now - p.timestamp < 86400000); // Last 24 hours
-        
-        pools.push({
-            poolId: poolId.toString(),
-            timestamp: now
-        });
-        
-        this.rateLimit.set(key, pools);
-        
-        // Check for pool spam
-        if (pools.length > 5) { // More than 5 pools per day
-            await this.flagSuspiciousActivity(creator, 'excessive_pool_creation', {
-                count: pools.length
-            });
-        }
-    }
-    
-    async flagSuspiciousActivity(address, type, details) {
-        const key = `${address}-${type}`;
-        
-        if (this.suspiciousActivities.has(key)) {
-            return; // Already flagged
-        }
-        
-        this.suspiciousActivities.set(key, {
-            address,
-            type,
-            details,
-            timestamp: Date.now(),
-            status: 'flagged'
-        });
-        
-        logger.warn(`Suspicious activity detected: ${type} for ${address}`);
-        await this.sendAlert(`Suspicious activity: ${type} for ${address}`, 'warning');
-        
-        // Store in database for investigation
-        await this.dbManager.saveSuspiciousActivity({
-            address,
-            type,
-            details,
-            timestamp: Date.now()
-        });
-    }
-    
-    async performSecurityChecks() {
-        await Promise.all([
-            this.checkContractBalance(),
-            this.checkUnusualGasUsage(),
-            this.checkFailedTransactions(),
-            this.monitorLargeTransactions()
-        ]);
-    }
-    
-    async checkContractBalance() {
-        try {
-            const balance = await this.provider.getBalance(CONFIG.contracts.poolManager);
-            const balanceEth = ethers.utils.formatEther(balance);
-            
-            // Alert if contract balance is unexpectedly high (possible stuck funds)
-            if (parseFloat(balanceEth) > 10) { // More than 10 ETH
-                await this.sendAlert(`High contract balance detected: ${balanceEth} ETH`, 'warning');
-            }
-            
-        } catch (error) {
-            logger.error(`Failed contrast balance check: ${error.message}`);
-        }
-    }
-    
-    async checkUnusualGasUsage() {
-        // Monitor recent transactions for unusual gas usage patterns
-        const recentBlocks = [];
-        const currentBlock = await this.provider.getBlockNumber();
-        
-        for (let i = 0; i < 10; i++) {
-            const block = await this.provider.getBlock(currentBlock - i);
-            recentBlocks.push(block);
-        }
-        
-        // Analyze gas usage patterns
-        const avgGasUsed = recentBlocks.reduce((sum, block) => 
-            sum + block.gasUsed.toNumber(), 0) / recentBlocks.length;
-        
-        if (avgGasUsed > 10000000) { // 10M gas average
-            await this.sendAlert(`High average gas usage detected: ${avgGasUsed}`, 'warning');
-        }
-    }
-    
-    async checkFailedTransactions() {
-        // This would integrate with transaction monitoring
-        // to detect patterns of failed transactions
-    }
-    
-    async monitorLargeTransactions() {
-        // Monitor for unusually large contributions that might indicate manipulation
-        const largeTxThreshold = ethers.utils.parseEther('100000000'); // 100M PNDC
-        
-        // This would be implemented with event filtering
-        // to catch large contributions in real-time
-    }
-}
-
-// Notification System
-class NotificationManager {
-    constructor() {
-        this.channels = new Map();
-        this.templates = new Map();
-        this.setupTemplates();
-    }
-    
-    setupTemplates() {
-        this.templates.set('pool_created', {
-            title: 'New Pool Created',
-            message: 'Pool {poolId} created with goal {goal} PNDC',
-            priority: 'info'
-        });
-        
-        this.templates.set('goal_reached', {
-            title: 'Pool Goal Reached',
-            message: 'Pool {poolId} has reached its goal of {goal} PNDC!',
-            priority: 'info'
-        });
-        
-        this.templates.set('auction_started', {
-            title: 'Auction Started',
-            message: 'New auction started with {poolCount} eligible pools',
-            priority: 'high'
-        });
-        
-        this.templates.set('auction_won', {
-            title: 'Pool Won Auction',
-            message: 'Pool {poolId} won the auction with {amount} PNDC!',
-            priority: 'high'
-        });
-        
-        this.templates.set('system_error', {
-            title: 'System Error',
-            message: 'Error in {component}: {error}',
-            priority: 'critical'
-        });
-    }
-    
-    addChannel(name, handler) {
-        this.channels.set(name, handler);
-    }
-    
-    async notify(templateName, data, channels = ['default']) {
-        const template = this.templates.get(templateName);
-        
-        if (!template) {
-            logger.error(`Unknown notification template: ${templateName}`);
-            return;
-        }
-        
-        const message = this.renderTemplate(template.message, data);
-        const notification = {
-            title: this.renderTemplate(template.title, data),
-            message,
-            priority: template.priority,
-            timestamp: Date.now(),
-            data
-        };
-        
-        for (const channelName of channels) {
-            const handler = this.channels.get(channelName);
-            
-            if (handler) {
-                try {
-                    await handler(notification);
-                } catch (error) {
-                    logger.error(`Notification failed for channel ${channelName}: ${error.message}`);
-                }
-            }
-        }
-    }
-    
-    renderTemplate(template, data) {
-        return template.replace(/\{(\w+)\}/g, (match, key) => {
-            return data[key] || match;
-        });
-    }
-    
-    // Built-in notification channels
-    async webhookHandler(notification) {
-        if (CONFIG.monitoring.alertWebhook) {
-            await axios.post(CONFIG.monitoring.alertWebhook, {
-                title: notification.title,
-                text: notification.message,
-                priority: notification.priority,
-                timestamp: notification.timestamp
-            });
-        }
-    }
-    
-    async emailHandler(notification) {
-        // Email notification implementation
-        logger.info(`Email notification: ${notification.title}`);
-    }
-    
-    async discordHandler(notification) {
-        // Discord webhook implementation
-        logger.info(`Discord notification: ${notification.title}`);
-    }
-}
-
-// Main Application
-async function main() {
-    try {
-        logger.info('Starting PNDC Bot System...');
-        
-        // Initialize components
-        const configManager = new ConfigManager();
-        await configManager.loadFromEnvironment();
-        await configManager.loadFromFile('config.json');
-        
-        const notificationManager = new NotificationManager();
-        notificationManager.addChannel('webhook', notificationManager.webhookHandler);
-        notificationManager.addChannel('email', notificationManager.emailHandler);
-        notificationManager.addChannel('discord', notificationManager.discordHandler);
-        
-        const botManager = new BotManager();
-        await botManager.initialize();
-        
-        // Start all bots
-        await botManager.startAll();
-        
-        // Graceful shutdown handling
-        process.on('SIGINT', async () => {
-            logger.info('Received SIGINT, shutting down gracefully...');
-            await botManager.stopAll();
-            process.exit(0);
-        });
-        
-        process.on('SIGTERM', async () => {
-            logger.info('Received SIGTERM, shutting down gracefully...');
-            await botManager.stopAll();
-            process.exit(0);
-        });
-        
-        // Keep the process running
-        logger.info('PNDC Bot System started successfully');
-        
-        // Health check endpoint (if running as web service)
-        if (process.env.HTTP_PORT) {
-            const express = require('express');
-            const app = express();
-            
-            app.get('/health', (req, res) => {
-                const status = botManager.getBotStatus();
-                res.json({
-                    status: 'healthy',
-                    bots: status,
-                    timestamp: Date.now()
-                });
-            });
-            
-            app.get('/metrics', async (req, res) => {
-                const metrics = await redis.get('current_metrics');
-                res.json(metrics ? JSON.parse(metrics) : {});
-            });
-            
-            app.listen(process.env.HTTP_PORT, () => {
-                logger.info(`Health check server running on port ${process.env.HTTP_PORT}`);
-            });
-        }
-        
-    } catch (error) {
-        logger.error(`Failed to start bot system: ${error.message}`);
-        process.exit(1);
-    }
-}
-
-// Export for testing or modular usage
-module.exports = {
-    BotManager,
-    ConfigManager,
-    NotificationManager,
-    Pond0xAuctionBot,
-    PoolMonitorBot,
-    BiddingBot,
-    RewardDistributionBot,
-    BridgeBot,
-    HealthMonitorBot,
-    AnalyticsBot,
-    SecurityMonitorBot
 };
 
-// Run main function if this file is executed directly
-if (require.main === module) {
-    main().catch(error => {
-        logger.error(`Fatal error: ${error.message}`);
-        process.exit(1);
-    });
-}
+// Enhanced Contract ABIs with Auction ID Support
+const ABIS = {
+    poolManager: [
+        "function getPoolInfo(uint256 poolId) view returns (address,uint256,uint256,uint256,bool,bool,bool,address,uint256)",
+        "function getPoolMultisigs(uint256 poolId) view returns (address,address)",
+        "function getEligiblePools() view returns (uint256[])",
+        "function isPoolEligibleForBid(uint256 poolId) view returns (bool)",
+        "function createPool(address,uint256,uint256,address,address) returns (uint256)",
+        "function contributeToPool(uint256,uint256)",
+        "function markPoolAsWinner(uint256,uint256)",
+        "function distributeRewards(uint256,uint256,address,uint256,uint8)",
+        "function getUserRewardForAuction(uint256,uint256,address) view returns (uint256)",
+        "function getAuctionWinners(uint256) view returns (uint256[])",
+        "event PoolCreated(uint256 indexed,address indexed,address indexed,uint256,uint256,address,address)",
+        "event ContributionMade(uint256 indexed,address indexed,uint256,uint256)",
+        "event GoalReached(uint256 indexed,uint256)",
+        "event PoolWon(uint256 indexed,uint256 indexed,uint256)",
+        "event RewardsReceived(uint256 indexed,uint256 indexed,address,uint256,uint8)",
+        "event RewardsDistributed(uint256 indexed,uint256 indexed,address indexed,uint256)",
+        "event CrossChainRewardInitiated(uint256 indexed,uint256 indexed,uint8)"
+    ],
+    auctionManager: [
+        "function startAuction(uint256,uint256) returns (uint256)",
+        "function placeBid(uint256) returns (uint256[])",
+        "function getAuction(uint256) view returns (uint256,bool,uint256,uint256,uint256[],uint256[])",
+        "function getActiveAuctions() view returns (uint256[])",
+        "function isAuctionActive(uint256) view returns (bool)",
+        "function endAuction(uint256)",
+        "event AuctionStarted(uint256 indexed,uint256,uint256,uint256[])",
+        "event BidPlaced(uint256 indexed,uint256 indexed,uint256)",
+        "event AuctionEnded(uint256 indexed,uint256[])"
+    ],
+    rewardDistributor: [
+        "function processRewards(uint256,uint256,address,uint256,bool,uint8)",
+        "function batchProcessRewards(uint256[],uint256[],address[],uint256[],bool[],uint8[])",
+        "function areAuctionRewardsProcessed(uint256,uint256) view returns (bool)",
+        "function getRewardStatus(uint256,uint256) view returns (bool,bytes32
