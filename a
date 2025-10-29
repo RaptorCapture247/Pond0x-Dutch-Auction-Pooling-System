@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Jupiter Swapper (Platform Fees)</title>
+  <title>Jupiter Swapper (Referral Fees)</title>
   <script src="https://unpkg.com/@solana/web3.js@1.95.1/lib/index.iife.min.js"></script>
   <style>
     body { font-family: sans-serif; background: #0b0e11; color: #eaeaea; text-align: center; padding: 2rem; }
@@ -25,16 +25,16 @@
   <h1>🪐 Jupiter Swapper</h1>
 
   <div class="info">
-    <p><strong>Fee Recipient (Referral Account):</strong></p>
+    <p><strong>Referral Account:</strong></p>
     <p style="font-size: 0.8rem; word-break: break-all;">45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp</p>
-    <p style="font-size: 0.85rem; color: #94a3b8;">Platform fee (0.1%) sent here for volume tracking</p>
+    <p style="font-size: 0.85rem; color: #94a3b8;">Platform fee: 0.1% sent to referral vault</p>
   </div>
 
   <div class="controls">
     <p><strong>📊 Slippage Tolerance</strong></p>
-    <div class="display"><span id="slippagePercent">2.00</span>%</div>
-    <input type="number" id="slippageInput" class="slider-input" min="10" max="5000" value="200" step="50" />
-    <p style="font-size: 0.8rem; color: #94a3b8;">bps (200 = 2%)</p>
+    <div class="display"><span id="slippagePercent">5.00</span>%</div>
+    <input type="number" id="slippageInput" class="slider-input" min="10" max="10000" value="500" step="100" />
+    <p style="font-size: 0.8rem; color: #94a3b8;">bps (500 = 5%)</p>
   </div>
 
   <div class="row">
@@ -70,9 +70,8 @@
   <div id="debug" class="debug" style="display: none;"></div>
 
   <script>
-    // Fee recipient wallet (receives platform fees for volume tracking)
     const FEE_WALLET = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp";
-    const PLATFORM_FEE_BPS = 10; // 0.1% - small fee for tracking
+    const PLATFORM_FEE_BPS = 10; // 0.1%
     
     const RPC_ENDPOINTS = [
       "https://mainnet.helius-rpc.com/?api-key=public",
@@ -93,7 +92,7 @@
     const TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
     const ASSOCIATED_TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
-    let slippageBps = parseInt(localStorage.getItem("slippageBps")) || 200;
+    let slippageBps = parseInt(localStorage.getItem("slippageBps")) || 500;
     document.getElementById("slippageInput").value = slippageBps;
     
     function updateSlippageDisplay(bps) {
@@ -102,7 +101,7 @@
     updateSlippageDisplay(slippageBps);
     
     document.getElementById("slippageInput").addEventListener("input", (e) => {
-      slippageBps = parseInt(e.target.value) || 200;
+      slippageBps = parseInt(e.target.value) || 500;
       localStorage.setItem("slippageBps", slippageBps);
       updateSlippageDisplay(slippageBps);
       getEstimate();
@@ -116,7 +115,6 @@
       console.log(`[${timestamp}]`, message);
     }
 
-    // Get Associated Token Account (per Jupiter docs)
     function getAssociatedTokenAddress(mint, owner) {
       const [address] = solanaWeb3.PublicKey.findProgramAddressSync(
         [
@@ -229,8 +227,8 @@
       const amount = Math.floor(uiAmount * 10 ** decimals);
       
       try {
-        // Include platformFeeBps in quote as per Jupiter docs
-        const url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&platformFeeBps=${PLATFORM_FEE_BPS}`;
+        // Try standard Jupiter v6 API
+        const url = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&platformFeeBps=${PLATFORM_FEE_BPS}`;
         
         const quote = await fetch(url).then(r => {
           if (!r.ok) throw new Error(`Quote failed`);
@@ -239,7 +237,7 @@
 
         const outDecimals = TOKEN_DECIMALS[outputMint] || 6;
         const estOut = quote.outAmount / 10 ** outDecimals;
-        document.getElementById("estimate").innerText = `Estimated output: ≈ ${estOut.toFixed(6)} (incl. 0.1% fee)`;
+        document.getElementById("estimate").innerText = `Estimated output: ≈ ${estOut.toFixed(6)}`;
       } catch (err) {
         console.error("Estimate error:", err);
         document.getElementById("estimate").innerText = "Estimated output: Error";
@@ -261,7 +259,7 @@
         return;
       }
 
-      document.getElementById("debug").innerHTML = "<strong>🔍 Debug Log:</strong><br>";
+      document.getElementById("debug").innerHTML = "<strong>🔍 Debug:</strong><br>";
       document.getElementById("debug").style.display = "block";
 
       const decimals = TOKEN_DECIMALS[inputMint] || 6;
@@ -270,53 +268,48 @@
       document.getElementById("swap").disabled = true;
 
       try {
-        debugLog(`Fee: ${PLATFORM_FEE_BPS} bps (0.1%)`);
-        debugLog(`Slippage: ${slippageBps} bps (${(slippageBps/100).toFixed(2)}%)`);
+        debugLog(`Fee: ${PLATFORM_FEE_BPS} bps, Slippage: ${slippageBps} bps`);
         
-        // Step 1: Get quote WITH platformFeeBps (per Jupiter docs)
-        const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&platformFeeBps=${PLATFORM_FEE_BPS}`;
+        // Try Jupiter v6 API
+        const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&platformFeeBps=${PLATFORM_FEE_BPS}`;
         
-        debugLog(`Fetching quote with platform fee...`);
+        debugLog(`Trying Jupiter v6 API...`);
         const quote = await fetch(quoteUrl).then(r => {
-          if (!r.ok) throw new Error(`Quote failed`);
+          if (!r.ok) throw new Error(`Quote failed: ${r.status}`);
           return r.json();
         });
         
         debugLog(`✓ Quote: ${quote.outAmount}`);
 
-        // Step 2: Get fee account (ATA for output token owned by fee wallet)
         const feeWalletPubkey = new solanaWeb3.PublicKey(FEE_WALLET);
         const outputMintPubkey = new solanaWeb3.PublicKey(outputMint);
         const feeAccount = getAssociatedTokenAddress(outputMintPubkey, feeWalletPubkey);
-        const feeAccountAddress = feeAccount.toBase58();
         
-        debugLog(`Fee account (ATA): ${feeAccountAddress}`);
+        debugLog(`Fee account: ${feeAccount.toBase58()}`);
         
         document.getElementById("status").innerText = "📝 Building transaction...";
 
-        // Step 3: Call swap WITH feeAccount (per Jupiter docs)
         const swapBody = {
-          userPublicKey: walletPublicKey,
           quoteResponse: quote,
+          userPublicKey: walletPublicKey,
           wrapAndUnwrapSol: true,
-          prioritizationFeeLamports: "auto",
-          dynamicComputeUnitLimit: true,
-          feeAccount: feeAccountAddress // Include fee account as per docs
+          feeAccount: feeAccount.toBase58(),
+          computeUnitPriceMicroLamports: "auto"
         };
 
-        debugLog(`Calling Jupiter swap API with fee account...`);
+        debugLog(`Calling v6 swap...`);
         
-        const swapRes = await fetch("https://lite-api.jup.ag/swap/v1/swap", {
+        const swapRes = await fetch("https://quote-api.jup.ag/v6/swap", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(swapBody),
         }).then(r => {
-          if (!r.ok) throw new Error(`Swap API failed`);
+          if (!r.ok) throw new Error(`Swap failed: ${r.status}`);
           return r.json();
         });
 
-        debugLog(`✓ Transaction built`);
-        document.getElementById("status").innerText = "✍️ Sign in wallet...";
+        debugLog(`✓ TX built`);
+        document.getElementById("status").innerText = "✍️ Sign...";
         
         const txBytes = Uint8Array.from(atob(swapRes.swapTransaction), c => c.charCodeAt(0));
         const versionedTx = solanaWeb3.VersionedTransaction.deserialize(txBytes);
@@ -332,17 +325,17 @@
         
         debugLog(`✓ TX: ${sig}`);
         document.getElementById("status").innerHTML =
-          `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a><br>⏳ Confirming...`;
+          `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View</a><br>⏳ Confirming...`;
 
         await connection.confirmTransaction(sig, "confirmed");
-        debugLog(`✅ CONFIRMED! Fee sent to ${FEE_WALLET.slice(0,8)}...`);
+        debugLog(`✅ CONFIRMED!`);
         await updateBalance();
         
-        document.getElementById("status").innerHTML = `🎉 Complete! Volume tracked. <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a>`;
+        document.getElementById("status").innerHTML = `🎉 Complete! Fee sent to referral. <a href="https://solscan.io/tx/${sig}" target="_blank">View</a>`;
       } catch (err) {
         console.error("Swap error:", err);
         debugLog(`❌ ${err.message}`);
-        document.getElementById("status").innerHTML = `<span class="error">❌ ${err.message.slice(0,100)}</span>`;
+        document.getElementById("status").innerHTML = `<span class="error">❌ ${err.message}</span>`;
       } finally {
         document.getElementById("swap").disabled = false;
       }
