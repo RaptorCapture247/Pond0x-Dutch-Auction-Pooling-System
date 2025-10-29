@@ -2,9 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Jupiter Swapper (Affiliate Referral)</title>
+  <title>Jupiter Swapper (Referral)</title>
   <script src="https://unpkg.com/@solana/web3.js@1.95.1/lib/index.iife.min.js"></script>
-  <script src="https://unpkg.com/@solana/spl-token@0.3.8/lib/index.iife.min.js"></script>
   <style>
     body { font-family: sans-serif; background: #0b0e11; color: #eaeaea; text-align: center; padding: 2rem; }
     input, select, button { margin: 0.5rem; padding: 0.6rem; font-size: 1rem; border-radius: 8px; border: none; }
@@ -14,83 +13,28 @@
     .row { margin-top: 1rem; }
     a { color: #818cf8; }
     .info { background: #1e293b; padding: 1rem; border-radius: 8px; margin: 1rem auto; max-width: 600px; font-size: 0.9rem; }
-    .fee-controls {
-      background: #1e293b;
-      padding: 1.5rem;
-      border-radius: 8px;
-      margin: 1rem auto;
-      max-width: 600px;
-    }
-    .fee-display {
-      font-size: 1.5rem;
-      font-weight: bold;
-      color: #818cf8;
-      margin: 0.5rem 0;
-    }
-    input[type="number"].fee-input {
-      width: 100px;
-      text-align: center;
-      background: #0b0e11;
-      color: #eaeaea;
-      border: 2px solid #4f46e5;
-    }
-    input[type="checkbox"] {
-      width: 20px;
-      height: 20px;
-      cursor: pointer;
-    }
-    #status {
-      margin-top: 1rem;
-      padding: 1rem;
-      border-radius: 8px;
-      min-height: 20px;
-    }
+    .controls { background: #1e293b; padding: 1.5rem; border-radius: 8px; margin: 1rem auto; max-width: 400px; }
+    .display { font-size: 1.5rem; font-weight: bold; color: #818cf8; margin: 0.5rem 0; }
+    input[type="number"].slider-input { width: 100px; text-align: center; background: #0b0e11; color: #eaeaea; border: 2px solid #4f46e5; }
+    #status { margin-top: 1rem; padding: 1rem; border-radius: 8px; min-height: 20px; }
     .error { color: #ef4444; }
-    .success { color: #10b981; }
-    .controls-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1rem;
-      max-width: 600px;
-      margin: 1rem auto;
-    }
     .debug { background: #1e293b; padding: 1rem; border-radius: 8px; margin: 1rem auto; max-width: 600px; font-size: 0.85rem; text-align: left; font-family: monospace; max-height: 300px; overflow-y: auto; }
   </style>
 </head>
 <body>
-  <h1>Jupiter Swapper (Platform Fee)</h1>
+  <h1>🪐 Jupiter Swapper</h1>
 
   <div class="info">
-    <p><strong>💰 Fee Collection Wallet:</strong></p>
+    <p><strong>Referral Account (Auto-tracked by Jupiter):</strong></p>
     <p style="font-size: 0.8rem; word-break: break-all;">45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp</p>
-    <p style="font-size: 0.9rem;">Fees sent to standard token accounts owned by this wallet</p>
-    <div style="margin-top: 1rem;">
-      <label>
-        <input type="checkbox" id="useFee" checked />
-        Enable Platform Fee (0.85% default)
-      </label>
-    </div>
+    <p style="font-size: 0.85rem; color: #94a3b8;">All swaps automatically tracked for referral rewards</p>
   </div>
 
-  <!-- Fee & Slippage Controls -->
-  <div class="controls-grid">
-    <div class="fee-controls">
-      <p><strong>💰 Platform Fee</strong></p>
-      <div class="fee-display">
-        <span id="feePercent">0.85</span>%
-      </div>
-      <input type="number" id="feeInput" class="fee-input" min="0" max="1000" value="85" step="5" />
-      <p style="font-size: 0.8rem; color: #94a3b8;">bps (85 = 0.85%)</p>
-    </div>
-
-    <div class="fee-controls">
-      <p><strong>📊 Slippage</strong></p>
-      <div class="fee-display">
-        <span id="slippagePercent">1.00</span>%
-      </div>
-      <input type="number" id="slippageInput" class="fee-input" min="10" max="5000" value="100" step="50" />
-      <p style="font-size: 0.8rem; color: #94a3b8;">bps (100 = 1%)</p>
-    </div>
+  <div class="controls">
+    <p><strong>📊 Slippage Tolerance</strong></p>
+    <div class="display"><span id="slippagePercent">1.00</span>%</div>
+    <input type="number" id="slippageInput" class="slider-input" min="10" max="5000" value="100" step="50" />
+    <p style="font-size: 0.8rem; color: #94a3b8;">bps (100 = 1%)</p>
   </div>
 
   <div class="row">
@@ -126,18 +70,16 @@
   <div id="debug" class="debug" style="display: none;"></div>
 
   <script>
-    // Fee collection wallet
-    const FEE_WALLET = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp";
+    // Referral account - swaps are auto-tracked by Jupiter
+    const REFERRAL_ACCOUNT = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp";
     
     const RPC_ENDPOINTS = [
       "https://mainnet.helius-rpc.com/?api-key=public",
-      "https://api.mainnet-beta.solana.com",
-      "https://solana-api.projectserum.com"
+      "https://api.mainnet-beta.solana.com"
     ];
     
     let currentRpcIndex = 0;
     let connection = new solanaWeb3.Connection(RPC_ENDPOINTS[currentRpcIndex], 'confirmed');
-    
     let walletPublicKey = null;
     let isWalletConnected = false;
 
@@ -147,27 +89,6 @@
       "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,
     };
 
-    // SPL Token Program ID
-    const TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-    const ASSOCIATED_TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-
-    // Fee management
-    let platformFeeBps = parseInt(localStorage.getItem("platformFeeBps")) || 85;
-    document.getElementById("feeInput").value = platformFeeBps;
-    
-    function updateFeeDisplay(bps) {
-      document.getElementById("feePercent").textContent = (bps / 100).toFixed(2);
-    }
-    updateFeeDisplay(platformFeeBps);
-    
-    document.getElementById("feeInput").addEventListener("input", (e) => {
-      platformFeeBps = parseInt(e.target.value) || 85;
-      localStorage.setItem("platformFeeBps", platformFeeBps);
-      updateFeeDisplay(platformFeeBps);
-      getEstimate();
-    });
-
-    // Slippage management
     let slippageBps = parseInt(localStorage.getItem("slippageBps")) || 100;
     document.getElementById("slippageInput").value = slippageBps;
     
@@ -191,59 +112,14 @@
       console.log(`[${timestamp}]`, message);
     }
 
-    // Get Associated Token Account address
-    function getAssociatedTokenAddress(mint, owner) {
-      const [address] = solanaWeb3.PublicKey.findProgramAddressSync(
-        [
-          owner.toBuffer(),
-          TOKEN_PROGRAM_ID.toBuffer(),
-          mint.toBuffer(),
-        ],
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      );
-      return address;
-    }
-
-    async function getFeeAccount(outputMint) {
-      try {
-        const feeWalletPubkey = new solanaWeb3.PublicKey(FEE_WALLET);
-        const mintPubkey = new solanaWeb3.PublicKey(outputMint);
-        
-        // Get standard ATA for the fee wallet
-        const ata = getAssociatedTokenAddress(mintPubkey, feeWalletPubkey);
-        const address = ata.toBase58();
-        
-        debugLog(`Fee account (ATA): ${address}`);
-        
-        // Check if it exists
-        try {
-          const accountInfo = await connection.getAccountInfo(ata);
-          if (accountInfo) {
-            debugLog(`✓ Fee account exists`);
-          } else {
-            debugLog(`⚠ Fee account will be auto-created`);
-          }
-        } catch (err) {
-          debugLog(`⚠ Could not verify: ${err.message}`);
-        }
-        
-        return address;
-      } catch (err) {
-        debugLog(`❌ Error getting fee account: ${err.message}`);
-        return null;
-      }
-    }
-
     async function retryRpcCall(fn, maxRetries = 2) {
       for (let i = 0; i <= maxRetries; i++) {
         try {
           return await fn();
         } catch (err) {
-          console.error(`RPC call failed (attempt ${i + 1}):`, err);
           if (i < maxRetries && err.message?.includes('403')) {
             currentRpcIndex = (currentRpcIndex + 1) % RPC_ENDPOINTS.length;
             connection = new solanaWeb3.Connection(RPC_ENDPOINTS[currentRpcIndex], 'confirmed');
-            console.log(`Switching to RPC: ${RPC_ENDPOINTS[currentRpcIndex]}`);
             await new Promise(resolve => setTimeout(resolve, 1000));
           } else {
             throw err;
@@ -255,12 +131,10 @@
     async function connectWallet() {
       try {
         if (!window.solana) {
-          alert("⚠️ Solana wallet not detected!\n\nPlease install Phantom or Solflare");
+          alert("Please install Phantom or Solflare wallet");
           return;
         }
 
-        document.getElementById("status").innerText = "🔄 Connecting...";
-        
         if (window.solana.isConnected && window.solana.publicKey) {
           walletPublicKey = window.solana.publicKey.toBase58();
           isWalletConnected = true;
@@ -272,11 +146,6 @@
         }
 
         const resp = await window.solana.connect();
-        
-        if (!resp || !resp.publicKey) {
-          throw new Error("No public key returned");
-        }
-        
         walletPublicKey = resp.publicKey.toBase58();
         isWalletConnected = true;
         
@@ -286,32 +155,18 @@
         await updateBalance();
         
       } catch (err) {
-        console.error("Connection error:", err);
-        isWalletConnected = false;
-        document.getElementById("swap").disabled = true;
-        document.getElementById("status").innerHTML = `<span class="error">❌ Connection failed</span>`;
+        document.getElementById("status").innerHTML = `<span class="error">❌ ${err.message}</span>`;
       }
     }
 
     async function disconnectWallet() {
-      try {
-        if (window.solana && window.solana.isConnected) {
-          await window.solana.disconnect();
-        }
-        walletPublicKey = null;
-        isWalletConnected = false;
-        document.getElementById("status").innerText = "Disconnected";
-        document.getElementById("connect").innerText = "Connect Wallet";
-        document.getElementById("swap").disabled = true;
-        document.getElementById("balance").innerText = "Balance: —";
-        document.getElementById("estimate").innerText = "Estimated output: —";
-      } catch (err) {
-        console.error("Disconnect error:", err);
-        walletPublicKey = null;
-        isWalletConnected = false;
-        document.getElementById("connect").innerText = "Connect Wallet";
-        document.getElementById("swap").disabled = true;
-      }
+      if (window.solana) await window.solana.disconnect();
+      walletPublicKey = null;
+      isWalletConnected = false;
+      document.getElementById("connect").innerText = "Connect Wallet";
+      document.getElementById("swap").disabled = true;
+      document.getElementById("status").innerText = "";
+      document.getElementById("balance").innerText = "Balance: —";
     }
 
     async function updateBalance() {
@@ -338,7 +193,7 @@
         }
         document.getElementById("balance").innerText = `Balance: ${balanceUI.toFixed(6)}`;
       } catch (err) {
-        console.error("Balance fetch error:", err);
+        console.error("Balance error:", err);
         document.getElementById("balance").innerText = `Balance: Error`;
       }
     }
@@ -357,37 +212,21 @@
       const amount = Math.floor(uiAmount * 10 ** decimals);
       
       try {
-        const useFee = document.getElementById("useFee").checked;
-        
-        let url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
-        
-        if (useFee) {
-          url += `&platformFeeBps=${platformFeeBps}`;
-        }
+        // Simple quote - no fee parameters, just referral tracking
+        const url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
         
         const quote = await fetch(url).then(r => {
-          if (!r.ok) throw new Error(`Quote failed: ${r.statusText}`);
+          if (!r.ok) throw new Error(`Quote failed`);
           return r.json();
         });
 
         const outDecimals = TOKEN_DECIMALS[outputMint] || 6;
         const estOut = quote.outAmount / 10 ** outDecimals;
-        
         document.getElementById("estimate").innerText = `Estimated output: ≈ ${estOut.toFixed(6)}`;
       } catch (err) {
         console.error("Estimate error:", err);
         document.getElementById("estimate").innerText = "Estimated output: Error";
       }
-    }
-
-    function parseJupiterError(errorMessage) {
-      if (errorMessage.includes('0x1789')) {
-        return '🔴 Slippage exceeded! Try: Increase slippage or disable fee';
-      }
-      if (errorMessage.includes('0x1')) {
-        return '❌ Insufficient balance';
-      }
-      return errorMessage;
     }
 
     async function swap() {
@@ -414,58 +253,46 @@
       document.getElementById("swap").disabled = true;
 
       try {
-        const useFee = document.getElementById("useFee").checked;
-        debugLog(`Fee: ${useFee ? 'ON' : 'OFF'} (${platformFeeBps} bps)`);
         debugLog(`Slippage: ${slippageBps} bps`);
+        debugLog(`Referral: ${REFERRAL_ACCOUNT.slice(0,8)}...`);
         
-        let quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
-        if (useFee) {
-          quoteUrl += `&platformFeeBps=${platformFeeBps}`;
-        }
+        // Get quote without any fee parameters
+        const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
         
         debugLog(`Getting quote...`);
         const quote = await fetch(quoteUrl).then(r => {
-          if (!r.ok) throw new Error(`Quote failed: ${r.statusText}`);
+          if (!r.ok) throw new Error(`Quote failed`);
           return r.json();
         });
         
         debugLog(`✓ Quote: ${quote.outAmount}`);
+        document.getElementById("status").innerText = "📝 Building transaction...";
 
-        let feeAccount = null;
-        if (useFee) {
-          feeAccount = await getFeeAccount(outputMint);
-          if (!feeAccount) {
-            throw new Error("Could not derive fee account");
-          }
-        }
-        
-        document.getElementById("status").innerText = "📝 Building...";
-
+        // Build swap with ONLY referralAccount parameter
         const swapBody = {
           userPublicKey: walletPublicKey,
           quoteResponse: quote,
           wrapAndUnwrapSol: true,
           prioritizationFeeLamports: "auto",
-          dynamicComputeUnitLimit: true
+          dynamicComputeUnitLimit: true,
+          // Try passing referral account directly
+          referralAccount: REFERRAL_ACCOUNT
         };
 
-        if (feeAccount && useFee) {
-          swapBody.feeAccount = feeAccount;
-          debugLog(`✓ Fee account: ${feeAccount.slice(0,8)}...`);
-        }
-
-        debugLog(`Calling swap API...`);
+        debugLog(`Swap with referral tracking only`);
+        debugLog(`Calling Jupiter API...`);
+        
         const swapRes = await fetch("https://lite-api.jup.ag/swap/v1/swap", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(swapBody),
         }).then(r => {
-          if (!r.ok) throw new Error(`Swap failed: ${r.statusText}`);
+          if (!r.ok) throw new Error(`Swap API failed`);
           return r.json();
         });
 
-        debugLog(`✓ TX ready`);
-        document.getElementById("status").innerText = "✍️ Sign...";
+        debugLog(`✓ Transaction ready`);
+        document.getElementById("status").innerText = "✍️ Sign in wallet...";
         
         const txBytes = Uint8Array.from(atob(swapRes.swapTransaction), c => c.charCodeAt(0));
         const versionedTx = solanaWeb3.VersionedTransaction.deserialize(txBytes);
@@ -481,18 +308,17 @@
         
         debugLog(`✓ Sent: ${sig}`);
         document.getElementById("status").innerHTML =
-          `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View</a><br>⏳ Confirming...`;
+          `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a><br>⏳ Confirming...`;
 
         await connection.confirmTransaction(sig, "confirmed");
-        debugLog(`✅ CONFIRMED!`);
+        debugLog(`✅ CONFIRMED - Swap tracked for referral!`);
         await updateBalance();
         
-        document.getElementById("status").innerHTML = `🎉 Complete! <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a>`;
+        document.getElementById("status").innerHTML = `🎉 Complete! Referral tracked. <a href="https://solscan.io/tx/${sig}" target="_blank">View</a>`;
       } catch (err) {
         console.error("Swap error:", err);
         debugLog(`❌ ${err.message}`);
-        const friendlyError = parseJupiterError(err.message);
-        document.getElementById("status").innerHTML = `<span class="error">${friendlyError}</span>`;
+        document.getElementById("status").innerHTML = `<span class="error">❌ ${err.message}</span>`;
       } finally {
         document.getElementById("swap").disabled = false;
       }
@@ -514,7 +340,6 @@
     };
     document.getElementById("outputMint").onchange = getEstimate;
     document.getElementById("amount").oninput = getEstimate;
-    document.getElementById("useFee").onchange = getEstimate;
 
     // Wallet event listeners
     if (window.solana) {
@@ -529,11 +354,7 @@
       });
       
       window.solana.on('disconnect', () => {
-        walletPublicKey = null;
-        isWalletConnected = false;
-        document.getElementById("connect").innerText = "Connect Wallet";
-        document.getElementById("swap").disabled = true;
-        document.getElementById("balance").innerText = "Balance: —";
+        disconnectWallet();
       });
 
       window.solana.on('accountChanged', (publicKey) => {
@@ -550,8 +371,6 @@
           connectWallet();
         }
       }, 500);
-    } else {
-      document.getElementById("status").innerHTML = '<span class="error">⚠️ No wallet</span>';
     }
   </script>
 </body>
