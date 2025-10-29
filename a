@@ -46,6 +46,7 @@
     }
     .error { color: #ef4444; }
     .success { color: #10b981; }
+    .warning { color: #f59e0b; }
     .controls-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -54,6 +55,7 @@
       margin: 1rem auto;
     }
     .debug { background: #1e293b; padding: 1rem; border-radius: 8px; margin: 1rem auto; max-width: 600px; font-size: 0.85rem; text-align: left; font-family: monospace; max-height: 300px; overflow-y: auto; }
+    .account-status { background: #1e293b; padding: 1rem; border-radius: 8px; margin: 1rem auto; max-width: 600px; font-size: 0.9rem; }
   </style>
 </head>
 <body>
@@ -64,10 +66,11 @@
     <p style="font-size: 0.8rem; word-break: break-all;">45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp</p>
     <div style="margin-top: 1rem;">
       <label>
-        <input type="checkbox" id="useReferral" />
-        Enable Referral Fee (uncheck if swaps fail)
+        <input type="checkbox" id="useReferral" checked />
+        Enable Referral Fee (earn affiliate rewards)
       </label>
     </div>
+    <div id="accountStatus" class="account-status" style="display: none;"></div>
   </div>
 
   <!-- Fee & Slippage Controls -->
@@ -119,6 +122,7 @@
 
   <button id="connect">Connect Wallet</button>
   <button id="swap" disabled>Swap</button>
+  <button id="checkAccount" style="display: none;">Check Referral Account</button>
 
   <p id="status"></p>
   <div id="debug" class="debug" style="display: none;"></div>
@@ -138,11 +142,18 @@
     
     let walletPublicKey = null;
     let isWalletConnected = false;
+    let referralAccountCache = {};
 
     const TOKEN_DECIMALS = {
       "So11111111111111111111111111111111111111112": 9,
       "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": 6,
       "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,
+    };
+
+    const TOKEN_NAMES = {
+      "So11111111111111111111111111111111111111112": "SOL",
+      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+      "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
     };
 
     // Fee management
@@ -193,6 +204,11 @@
 
     async function getReferralTokenAccount(outputMint) {
       try {
+        // Check cache first
+        if (referralAccountCache[outputMint]) {
+          return referralAccountCache[outputMint];
+        }
+
         const referralAccountPubkey = new solanaWeb3.PublicKey(REFERRAL_ACCOUNT);
         const mintPubkey = new solanaWeb3.PublicKey(outputMint);
         const referralProgramId = new solanaWeb3.PublicKey(REFERRAL_PROGRAM_ID);
@@ -207,12 +223,53 @@
         );
         
         const address = referralTokenAccount.toBase58();
-        debugLog(`Referral account: ${address}`);
         
-        return address;
+        // Check if account exists
+        try {
+          const accountInfo = await connection.getAccountInfo(referralTokenAccount);
+          if (accountInfo) {
+            debugLog(`✓ Referral account exists: ${address}`);
+            referralAccountCache[outputMint] = { address, exists: true };
+          } else {
+            debugLog(`⚠ Referral account doesn't exist yet: ${address}`);
+            debugLog(`  It will be auto-created on first swap`);
+            referralAccountCache[outputMint] = { address, exists: false };
+          }
+        } catch (err) {
+          debugLog(`⚠ Could not verify account: ${err.message}`);
+          referralAccountCache[outputMint] = { address, exists: false };
+        }
+        
+        return referralAccountCache[outputMint];
       } catch (err) {
         debugLog(`❌ Error deriving referral account: ${err.message}`);
         return null;
+      }
+    }
+
+    async function checkReferralAccount() {
+      const outputMint = document.getElementById("outputMint").value;
+      const tokenName = TOKEN_NAMES[outputMint];
+      
+      document.getElementById("accountStatus").style.display = "block";
+      document.getElementById("accountStatus").innerHTML = `<p>🔍 Checking referral account for ${tokenName}...</p>`;
+      
+      const accountInfo = await getReferralTokenAccount(outputMint);
+      
+      if (accountInfo) {
+        if (accountInfo.exists) {
+          document.getElementById("accountStatus").innerHTML = 
+            `<p class="success">✅ Referral account ready for ${tokenName}</p>` +
+            `<p style="font-size: 0.8rem; word-break: break-all;">${accountInfo.address}</p>`;
+        } else {
+          document.getElementById("accountStatus").innerHTML = 
+            `<p class="warning">⚠️ Referral account for ${tokenName} will be created on first swap</p>` +
+            `<p style="font-size: 0.8rem; word-break: break-all;">${accountInfo.address}</p>` +
+            `<p style="font-size: 0.85rem;">This is normal - Jupiter will auto-create it.</p>`;
+        }
+      } else {
+        document.getElementById("accountStatus").innerHTML = 
+          `<p class="error">❌ Could not derive referral account</p>`;
       }
     }
 
@@ -249,6 +306,7 @@
           document.getElementById("status").innerHTML = `✅ Connected: <strong>${walletPublicKey.slice(0, 4)}...${walletPublicKey.slice(-4)}</strong>`;
           document.getElementById("connect").innerText = "Disconnect";
           document.getElementById("swap").disabled = false;
+          document.getElementById("checkAccount").style.display = "inline-block";
           await updateBalance();
           return;
         }
@@ -265,6 +323,7 @@
         document.getElementById("status").innerHTML = `✅ Connected: <strong>${walletPublicKey.slice(0, 4)}...${walletPublicKey.slice(-4)}</strong>`;
         document.getElementById("connect").innerText = "Disconnect";
         document.getElementById("swap").disabled = false;
+        document.getElementById("checkAccount").style.display = "inline-block";
         await updateBalance();
         
       } catch (err) {
@@ -290,6 +349,7 @@
         document.getElementById("status").innerText = "Disconnected";
         document.getElementById("connect").innerText = "Connect Wallet";
         document.getElementById("swap").disabled = true;
+        document.getElementById("checkAccount").style.display = "none";
         document.getElementById("balance").innerText = "Balance: —";
         document.getElementById("estimate").innerText = "Estimated output: —";
       } catch (err) {
@@ -346,7 +406,6 @@
       try {
         const useReferral = document.getElementById("useReferral").checked;
         
-        // Build URL without fee param if not using referral
         let url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
         
         if (useReferral) {
@@ -369,7 +428,7 @@
 
     function parseJupiterError(errorMessage) {
       if (errorMessage.includes('0x1789')) {
-        return '🔴 Slippage exceeded!\n\n💡 Try:\n• Unchecking referral\n• Increasing slippage to 3-5%\n• Using smaller amount';
+        return '🔴 Slippage exceeded!\n\n💡 Solutions:\n• Try without referral first\n• Increase slippage to 3-5%\n• Use smaller amount\n• The referral account may need to be initialized with a non-referral swap first';
       }
       if (errorMessage.includes('0x1')) {
         return '❌ Insufficient balance';
@@ -406,8 +465,9 @@
 
       try {
         const useReferral = document.getElementById("useReferral").checked;
-        debugLog(`Referral: ${useReferral ? 'ENABLED' : 'DISABLED'}`);
-        debugLog(`Fee: ${platformFeeBps} bps, Slippage: ${slippageBps} bps`);
+        debugLog(`Referral: ${useReferral ? 'ENABLED ✓' : 'DISABLED'}`);
+        debugLog(`Fee: ${platformFeeBps} bps (${(platformFeeBps/100).toFixed(2)}%)`);
+        debugLog(`Slippage: ${slippageBps} bps (${(slippageBps/100).toFixed(2)}%)`);
         
         // Build URL
         let quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
@@ -421,13 +481,15 @@
           return r.json();
         });
         
-        debugLog(`✓ Quote OK: ${quote.outAmount}`);
+        debugLog(`✓ Quote received: ${quote.outAmount}`);
 
-        let feeAccount = null;
+        let feeAccountInfo = null;
         if (useReferral) {
-          feeAccount = await getReferralTokenAccount(outputMint);
-          if (!feeAccount) {
-            debugLog(`⚠️ No fee account - disabling referral`);
+          feeAccountInfo = await getReferralTokenAccount(outputMint);
+          if (!feeAccountInfo || !feeAccountInfo.address) {
+            debugLog(`⚠️ Could not derive fee account - proceeding without referral`);
+          } else if (!feeAccountInfo.exists) {
+            debugLog(`ℹ️ Fee account will be auto-created by Jupiter`);
           }
         }
         
@@ -441,15 +503,15 @@
           dynamicComputeUnitLimit: true
         };
 
-        // Only add feeAccount if we have one
-        if (feeAccount && useReferral) {
-          swapBody.feeAccount = feeAccount;
-          debugLog(`✓ Fee account included`);
+        // Only add feeAccount if we successfully derived it
+        if (feeAccountInfo && feeAccountInfo.address && useReferral) {
+          swapBody.feeAccount = feeAccountInfo.address;
+          debugLog(`✓ Including fee account: ${feeAccountInfo.address.slice(0,8)}...`);
         } else {
-          debugLog(`ℹ No fee account`);
+          debugLog(`ℹ️ No fee account in transaction`);
         }
 
-        debugLog(`Calling swap API...`);
+        debugLog(`Calling Jupiter swap API...`);
         const swapRes = await fetch("https://lite-api.jup.ag/swap/v1/swap", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -459,33 +521,44 @@
           return r.json();
         });
 
-        debugLog(`✓ Transaction ready`);
+        debugLog(`✓ Transaction built successfully`);
         document.getElementById("status").innerText = "✍️ Sign in wallet...";
         const tx = swapRes.swapTransaction;
         
         const txBytes = Uint8Array.from(atob(tx), c => c.charCodeAt(0));
         const versionedTx = solanaWeb3.VersionedTransaction.deserialize(txBytes);
+        
+        debugLog(`Requesting signature...`);
         const signedTx = await window.solana.signTransaction(versionedTx);
         
-        debugLog(`✓ Signed, sending...`);
-        document.getElementById("status").innerText = "📡 Sending...";
+        debugLog(`✓ Signed, sending to network...`);
+        document.getElementById("status").innerText = "📡 Sending transaction...";
         
         const sig = await connection.sendRawTransaction(signedTx.serialize(), {
           skipPreflight: false,
           maxRetries: 2
         });
         
-        debugLog(`✓ Sent: ${sig}`);
+        debugLog(`✓ Transaction sent: ${sig}`);
         document.getElementById("status").innerHTML =
-          `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a><br>⏳ Confirming...`;
+          `✅ Sent! <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a><br>⏳ Waiting for confirmation...`;
 
         await connection.confirmTransaction(sig, "confirmed");
-        debugLog(`✅ CONFIRMED!`);
+        debugLog(`✅ TRANSACTION CONFIRMED!`);
+        
+        // Clear cache to recheck account on next swap
+        referralAccountCache = {};
+        
         await updateBalance();
-        document.getElementById("status").innerHTML = `🎉 Swap complete! <a href="https://solscan.io/tx/${sig}" target="_blank">View</a>`;
+        
+        const successMsg = useReferral ? 
+          `🎉 Swap complete! Affiliate fee earned! <a href="https://solscan.io/tx/${sig}" target="_blank">View</a>` :
+          `🎉 Swap complete! <a href="https://solscan.io/tx/${sig}" target="_blank">View</a>`;
+        
+        document.getElementById("status").innerHTML = successMsg;
       } catch (err) {
         console.error("Swap error:", err);
-        debugLog(`❌ ${err.message}`);
+        debugLog(`❌ ERROR: ${err.message}`);
         const friendlyError = parseJupiterError(err.message);
         document.getElementById("status").innerHTML = `<span class="error">${friendlyError}</span>`;
       } finally {
@@ -503,13 +576,24 @@
     };
     
     document.getElementById("swap").onclick = swap;
+    document.getElementById("checkAccount").onclick = checkReferralAccount;
     document.getElementById("inputMint").onchange = async () => { 
       await updateBalance(); 
       await getEstimate(); 
     };
-    document.getElementById("outputMint").onchange = getEstimate;
+    document.getElementById("outputMint").onchange = async () => {
+      await getEstimate();
+      if (document.getElementById("useReferral").checked && isWalletConnected) {
+        await checkReferralAccount();
+      }
+    };
     document.getElementById("amount").oninput = getEstimate;
-    document.getElementById("useReferral").onchange = getEstimate;
+    document.getElementById("useReferral").onchange = async () => {
+      await getEstimate();
+      if (document.getElementById("useReferral").checked && isWalletConnected) {
+        await checkReferralAccount();
+      }
+    };
 
     // Wallet event listeners
     if (window.solana) {
@@ -519,6 +603,7 @@
           isWalletConnected = true;
           document.getElementById("connect").innerText = "Disconnect";
           document.getElementById("swap").disabled = false;
+          document.getElementById("checkAccount").style.display = "inline-block";
           updateBalance();
         }
       });
@@ -528,6 +613,7 @@
         isWalletConnected = false;
         document.getElementById("connect").innerText = "Connect Wallet";
         document.getElementById("swap").disabled = true;
+        document.getElementById("checkAccount").style.display = "none";
         document.getElementById("balance").innerText = "Balance: —";
       });
 
