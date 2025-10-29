@@ -1,8 +1,9 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Jupiter Swapper (Referral Fees)</title>
+  <title>Jupiter Swapper (Referral)</title>
   <script src="https://unpkg.com/@solana/web3.js@1.95.1/lib/index.iife.min.js"></script>
   <style>
     body { font-family: sans-serif; background: #0b0e11; color: #eaeaea; text-align: center; padding: 2rem; }
@@ -25,16 +26,16 @@
   <h1>🪐 Jupiter Swapper</h1>
 
   <div class="info">
-    <p><strong>Referral Account:</strong></p>
+    <p><strong>Referral Account (Auto-tracked by Jupiter):</strong></p>
     <p style="font-size: 0.8rem; word-break: break-all;">45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp</p>
-    <p style="font-size: 0.85rem; color: #94a3b8;">Platform fee: 0.1% sent to referral vault</p>
+    <p style="font-size: 0.85rem; color: #94a3b8;">All swaps automatically tracked for referral rewards</p>
   </div>
 
   <div class="controls">
     <p><strong>📊 Slippage Tolerance</strong></p>
-    <div class="display"><span id="slippagePercent">5.00</span>%</div>
-    <input type="number" id="slippageInput" class="slider-input" min="10" max="10000" value="500" step="100" />
-    <p style="font-size: 0.8rem; color: #94a3b8;">bps (500 = 5%)</p>
+    <div class="display"><span id="slippagePercent">1.00</span>%</div>
+    <input type="number" id="slippageInput" class="slider-input" min="10" max="5000" value="100" step="50" />
+    <p style="font-size: 0.8rem; color: #94a3b8;">bps (100 = 1%)</p>
   </div>
 
   <div class="row">
@@ -70,8 +71,8 @@
   <div id="debug" class="debug" style="display: none;"></div>
 
   <script>
-    const FEE_WALLET = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp";
-    const PLATFORM_FEE_BPS = 10; // 0.1%
+    // Referral account - swaps are auto-tracked by Jupiter
+    const REFERRAL_ACCOUNT = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp";
     
     const RPC_ENDPOINTS = [
       "https://mainnet.helius-rpc.com/?api-key=public",
@@ -89,10 +90,7 @@
       "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,
     };
 
-    const TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-    const ASSOCIATED_TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-
-    let slippageBps = parseInt(localStorage.getItem("slippageBps")) || 500;
+    let slippageBps = parseInt(localStorage.getItem("slippageBps")) || 100;
     document.getElementById("slippageInput").value = slippageBps;
     
     function updateSlippageDisplay(bps) {
@@ -101,7 +99,7 @@
     updateSlippageDisplay(slippageBps);
     
     document.getElementById("slippageInput").addEventListener("input", (e) => {
-      slippageBps = parseInt(e.target.value) || 500;
+      slippageBps = parseInt(e.target.value) || 100;
       localStorage.setItem("slippageBps", slippageBps);
       updateSlippageDisplay(slippageBps);
       getEstimate();
@@ -113,18 +111,6 @@
       const timestamp = new Date().toLocaleTimeString();
       debugDiv.innerHTML += `<div>[${timestamp}] ${message}</div>`;
       console.log(`[${timestamp}]`, message);
-    }
-
-    function getAssociatedTokenAddress(mint, owner) {
-      const [address] = solanaWeb3.PublicKey.findProgramAddressSync(
-        [
-          owner.toBuffer(),
-          TOKEN_PROGRAM_ID.toBuffer(),
-          mint.toBuffer(),
-        ],
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      );
-      return address;
     }
 
     async function retryRpcCall(fn, maxRetries = 2) {
@@ -227,8 +213,8 @@
       const amount = Math.floor(uiAmount * 10 ** decimals);
       
       try {
-        // Try standard Jupiter v6 API
-        const url = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&platformFeeBps=${PLATFORM_FEE_BPS}`;
+        // Simple quote - no fee parameters, just referral tracking
+        const url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
         
         const quote = await fetch(url).then(r => {
           if (!r.ok) throw new Error(`Quote failed`);
@@ -268,48 +254,46 @@
       document.getElementById("swap").disabled = true;
 
       try {
-        debugLog(`Fee: ${PLATFORM_FEE_BPS} bps, Slippage: ${slippageBps} bps`);
+        debugLog(`Slippage: ${slippageBps} bps`);
+        debugLog(`Referral: ${REFERRAL_ACCOUNT.slice(0,8)}...`);
         
-        // Try Jupiter v6 API
-        const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&platformFeeBps=${PLATFORM_FEE_BPS}`;
+        // Get quote without any fee parameters
+        const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
         
-        debugLog(`Trying Jupiter v6 API...`);
+        debugLog(`Getting quote...`);
         const quote = await fetch(quoteUrl).then(r => {
-          if (!r.ok) throw new Error(`Quote failed: ${r.status}`);
+          if (!r.ok) throw new Error(`Quote failed`);
           return r.json();
         });
         
         debugLog(`✓ Quote: ${quote.outAmount}`);
-
-        const feeWalletPubkey = new solanaWeb3.PublicKey(FEE_WALLET);
-        const outputMintPubkey = new solanaWeb3.PublicKey(outputMint);
-        const feeAccount = getAssociatedTokenAddress(outputMintPubkey, feeWalletPubkey);
-        
-        debugLog(`Fee account: ${feeAccount.toBase58()}`);
-        
         document.getElementById("status").innerText = "📝 Building transaction...";
 
+        // Build swap with ONLY referralAccount parameter
         const swapBody = {
-          quoteResponse: quote,
           userPublicKey: walletPublicKey,
+          quoteResponse: quote,
           wrapAndUnwrapSol: true,
-          feeAccount: feeAccount.toBase58(),
-          computeUnitPriceMicroLamports: "auto"
+          prioritizationFeeLamports: "auto",
+          dynamicComputeUnitLimit: true,
+          // Try passing referral account directly
+          referralAccount: REFERRAL_ACCOUNT
         };
 
-        debugLog(`Calling v6 swap...`);
+        debugLog(`Swap with referral tracking only`);
+        debugLog(`Calling Jupiter API...`);
         
-        const swapRes = await fetch("https://quote-api.jup.ag/v6/swap", {
+        const swapRes = await fetch("https://lite-api.jup.ag/swap/v1/swap", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(swapBody),
         }).then(r => {
-          if (!r.ok) throw new Error(`Swap failed: ${r.status}`);
+          if (!r.ok) throw new Error(`Swap API failed`);
           return r.json();
         });
 
-        debugLog(`✓ TX built`);
-        document.getElementById("status").innerText = "✍️ Sign...";
+        debugLog(`✓ Transaction ready`);
+        document.getElementById("status").innerText = "✍️ Sign in wallet...";
         
         const txBytes = Uint8Array.from(atob(swapRes.swapTransaction), c => c.charCodeAt(0));
         const versionedTx = solanaWeb3.VersionedTransaction.deserialize(txBytes);
@@ -323,15 +307,15 @@
           maxRetries: 2
         });
         
-        debugLog(`✓ TX: ${sig}`);
+        debugLog(`✓ Sent: ${sig}`);
         document.getElementById("status").innerHTML =
-          `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View</a><br>⏳ Confirming...`;
+          `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a><br>⏳ Confirming...`;
 
         await connection.confirmTransaction(sig, "confirmed");
-        debugLog(`✅ CONFIRMED!`);
+        debugLog(`✅ CONFIRMED - Swap tracked for referral!`);
         await updateBalance();
         
-        document.getElementById("status").innerHTML = `🎉 Complete! Fee sent to referral. <a href="https://solscan.io/tx/${sig}" target="_blank">View</a>`;
+        document.getElementById("status").innerHTML = `🎉 Complete! Referral tracked. <a href="https://solscan.io/tx/${sig}" target="_blank">View</a>`;
       } catch (err) {
         console.error("Swap error:", err);
         debugLog(`❌ ${err.message}`);
