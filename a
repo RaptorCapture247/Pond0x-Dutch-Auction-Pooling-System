@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <title>Jupiter Swapper (Affiliate Referral)</title>
   <script src="https://unpkg.com/@solana/web3.js@1.95.1/lib/index.iife.min.js"></script>
+  <script src="https://unpkg.com/@solana/spl-token@0.3.8/lib/index.iife.min.js"></script>
   <style>
     body { font-family: sans-serif; background: #0b0e11; color: #eaeaea; text-align: center; padding: 2rem; }
     input, select, button { margin: 0.5rem; padding: 0.6rem; font-size: 1rem; border-radius: 8px; border: none; }
@@ -46,7 +47,6 @@
     }
     .error { color: #ef4444; }
     .success { color: #10b981; }
-    .warning { color: #f59e0b; }
     .controls-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -61,13 +61,13 @@
   <h1>Jupiter Swapper (Platform Fee)</h1>
 
   <div class="info">
-    <p><strong>💰 Platform Fee Collection</strong></p>
-    <p style="font-size: 0.9rem;">This swapper collects a small platform fee on each swap.</p>
-    <p style="font-size: 0.85rem; color: #94a3b8;">Fee is deducted from output amount and collected automatically by Jupiter.</p>
+    <p><strong>💰 Fee Collection Wallet:</strong></p>
+    <p style="font-size: 0.8rem; word-break: break-all;">45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp</p>
+    <p style="font-size: 0.9rem;">Fees sent to standard token accounts owned by this wallet</p>
     <div style="margin-top: 1rem;">
       <label>
         <input type="checkbox" id="useFee" checked />
-        Enable Platform Fee (default 0.85%)
+        Enable Platform Fee (0.85% default)
       </label>
     </div>
   </div>
@@ -126,6 +126,9 @@
   <div id="debug" class="debug" style="display: none;"></div>
 
   <script>
+    // Fee collection wallet
+    const FEE_WALLET = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp";
+    
     const RPC_ENDPOINTS = [
       "https://mainnet.helius-rpc.com/?api-key=public",
       "https://api.mainnet-beta.solana.com",
@@ -143,6 +146,10 @@
       "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": 6,
       "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,
     };
+
+    // SPL Token Program ID
+    const TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+    const ASSOCIATED_TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
     // Fee management
     let platformFeeBps = parseInt(localStorage.getItem("platformFeeBps")) || 85;
@@ -184,6 +191,49 @@
       console.log(`[${timestamp}]`, message);
     }
 
+    // Get Associated Token Account address
+    function getAssociatedTokenAddress(mint, owner) {
+      const [address] = solanaWeb3.PublicKey.findProgramAddressSync(
+        [
+          owner.toBuffer(),
+          TOKEN_PROGRAM_ID.toBuffer(),
+          mint.toBuffer(),
+        ],
+        ASSOCIATED_TOKEN_PROGRAM_ID
+      );
+      return address;
+    }
+
+    async function getFeeAccount(outputMint) {
+      try {
+        const feeWalletPubkey = new solanaWeb3.PublicKey(FEE_WALLET);
+        const mintPubkey = new solanaWeb3.PublicKey(outputMint);
+        
+        // Get standard ATA for the fee wallet
+        const ata = getAssociatedTokenAddress(mintPubkey, feeWalletPubkey);
+        const address = ata.toBase58();
+        
+        debugLog(`Fee account (ATA): ${address}`);
+        
+        // Check if it exists
+        try {
+          const accountInfo = await connection.getAccountInfo(ata);
+          if (accountInfo) {
+            debugLog(`✓ Fee account exists`);
+          } else {
+            debugLog(`⚠ Fee account will be auto-created`);
+          }
+        } catch (err) {
+          debugLog(`⚠ Could not verify: ${err.message}`);
+        }
+        
+        return address;
+      } catch (err) {
+        debugLog(`❌ Error getting fee account: ${err.message}`);
+        return null;
+      }
+    }
+
     async function retryRpcCall(fn, maxRetries = 2) {
       for (let i = 0; i <= maxRetries; i++) {
         try {
@@ -205,11 +255,11 @@
     async function connectWallet() {
       try {
         if (!window.solana) {
-          alert("⚠️ Solana wallet not detected!\n\nPlease install:\n- Phantom Wallet\n- Solflare\n- Or another Solana wallet extension");
+          alert("⚠️ Solana wallet not detected!\n\nPlease install Phantom or Solflare");
           return;
         }
 
-        document.getElementById("status").innerText = "🔄 Requesting wallet connection...";
+        document.getElementById("status").innerText = "🔄 Connecting...";
         
         if (window.solana.isConnected && window.solana.publicKey) {
           walletPublicKey = window.solana.publicKey.toBase58();
@@ -224,7 +274,7 @@
         const resp = await window.solana.connect();
         
         if (!resp || !resp.publicKey) {
-          throw new Error("No public key returned from wallet");
+          throw new Error("No public key returned");
         }
         
         walletPublicKey = resp.publicKey.toBase58();
@@ -239,12 +289,7 @@
         console.error("Connection error:", err);
         isWalletConnected = false;
         document.getElementById("swap").disabled = true;
-        
-        if (err.code === 4001 || err.message?.includes("User rejected")) {
-          document.getElementById("status").innerHTML = `<span class="error">❌ Connection rejected</span>`;
-        } else {
-          document.getElementById("status").innerHTML = `<span class="error">❌ Connection failed: ${err.message}</span>`;
-        }
+        document.getElementById("status").innerHTML = `<span class="error">❌ Connection failed</span>`;
       }
     }
 
@@ -327,12 +372,8 @@
 
         const outDecimals = TOKEN_DECIMALS[outputMint] || 6;
         const estOut = quote.outAmount / 10 ** outDecimals;
-        const feeAmount = useFee ? (estOut * platformFeeBps / 10000) : 0;
-        const netOut = estOut - feeAmount;
         
-        document.getElementById("estimate").innerText = useFee ? 
-          `Estimated output: ≈ ${netOut.toFixed(6)} (${estOut.toFixed(6)} - ${feeAmount.toFixed(6)} fee)` :
-          `Estimated output: ≈ ${estOut.toFixed(6)}`;
+        document.getElementById("estimate").innerText = `Estimated output: ≈ ${estOut.toFixed(6)}`;
       } catch (err) {
         console.error("Estimate error:", err);
         document.getElementById("estimate").innerText = "Estimated output: Error";
@@ -341,13 +382,10 @@
 
     function parseJupiterError(errorMessage) {
       if (errorMessage.includes('0x1789')) {
-        return '🔴 Slippage exceeded!\n\n💡 Try: Increase slippage to 3-5% or use smaller amount';
+        return '🔴 Slippage exceeded! Try: Increase slippage or disable fee';
       }
       if (errorMessage.includes('0x1')) {
         return '❌ Insufficient balance';
-      }
-      if (errorMessage.includes('0x0')) {
-        return '❌ Insufficient liquidity';
       }
       return errorMessage;
     }
@@ -358,17 +396,16 @@
       const uiAmount = parseFloat(document.getElementById("amount").value);
       
       if (!walletPublicKey || !isWalletConnected) {
-        alert("Please connect your wallet first");
+        alert("Connect wallet first");
         return;
       }
       
       if (!uiAmount || uiAmount <= 0) {
-        alert("Please enter a valid amount");
+        alert("Enter valid amount");
         return;
       }
 
-      // Clear debug log
-      document.getElementById("debug").innerHTML = "<strong>🔍 Debug Log:</strong><br>";
+      document.getElementById("debug").innerHTML = "<strong>🔍 Debug:</strong><br>";
       document.getElementById("debug").style.display = "block";
 
       const decimals = TOKEN_DECIMALS[inputMint] || 6;
@@ -378,25 +415,31 @@
 
       try {
         const useFee = document.getElementById("useFee").checked;
-        debugLog(`Platform fee: ${useFee ? 'ENABLED' : 'DISABLED'}`);
-        debugLog(`Fee: ${platformFeeBps} bps (${(platformFeeBps/100).toFixed(2)}%)`);
-        debugLog(`Slippage: ${slippageBps} bps (${(slippageBps/100).toFixed(2)}%)`);
+        debugLog(`Fee: ${useFee ? 'ON' : 'OFF'} (${platformFeeBps} bps)`);
+        debugLog(`Slippage: ${slippageBps} bps`);
         
-        // Build URL - include platformFeeBps in quote if fee enabled
         let quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
         if (useFee) {
           quoteUrl += `&platformFeeBps=${platformFeeBps}`;
         }
         
-        debugLog(`Fetching quote...`);
+        debugLog(`Getting quote...`);
         const quote = await fetch(quoteUrl).then(r => {
           if (!r.ok) throw new Error(`Quote failed: ${r.statusText}`);
           return r.json();
         });
         
-        debugLog(`✓ Quote received: ${quote.outAmount}`);
+        debugLog(`✓ Quote: ${quote.outAmount}`);
+
+        let feeAccount = null;
+        if (useFee) {
+          feeAccount = await getFeeAccount(outputMint);
+          if (!feeAccount) {
+            throw new Error("Could not derive fee account");
+          }
+        }
         
-        document.getElementById("status").innerText = "📝 Building transaction...";
+        document.getElementById("status").innerText = "📝 Building...";
 
         const swapBody = {
           userPublicKey: walletPublicKey,
@@ -406,55 +449,48 @@
           dynamicComputeUnitLimit: true
         };
 
-        // DON'T include feeAccount - let Jupiter handle fees internally via platformFeeBps in quote
-        debugLog(`Building swap without custom fee account`);
-        debugLog(`Jupiter will handle platform fee internally`);
+        if (feeAccount && useFee) {
+          swapBody.feeAccount = feeAccount;
+          debugLog(`✓ Fee account: ${feeAccount.slice(0,8)}...`);
+        }
 
-        debugLog(`Calling Jupiter swap API...`);
+        debugLog(`Calling swap API...`);
         const swapRes = await fetch("https://lite-api.jup.ag/swap/v1/swap", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(swapBody),
         }).then(r => {
-          if (!r.ok) throw new Error(`Swap API failed: ${r.statusText}`);
+          if (!r.ok) throw new Error(`Swap failed: ${r.statusText}`);
           return r.json();
         });
 
-        debugLog(`✓ Transaction built successfully`);
-        document.getElementById("status").innerText = "✍️ Sign in wallet...";
-        const tx = swapRes.swapTransaction;
+        debugLog(`✓ TX ready`);
+        document.getElementById("status").innerText = "✍️ Sign...";
         
-        const txBytes = Uint8Array.from(atob(tx), c => c.charCodeAt(0));
+        const txBytes = Uint8Array.from(atob(swapRes.swapTransaction), c => c.charCodeAt(0));
         const versionedTx = solanaWeb3.VersionedTransaction.deserialize(txBytes);
-        
-        debugLog(`Requesting signature...`);
         const signedTx = await window.solana.signTransaction(versionedTx);
         
-        debugLog(`✓ Signed, sending to network...`);
-        document.getElementById("status").innerText = "📡 Sending transaction...";
+        debugLog(`✓ Signed, sending...`);
+        document.getElementById("status").innerText = "📡 Sending...";
         
         const sig = await connection.sendRawTransaction(signedTx.serialize(), {
           skipPreflight: false,
           maxRetries: 2
         });
         
-        debugLog(`✓ Transaction sent: ${sig}`);
+        debugLog(`✓ Sent: ${sig}`);
         document.getElementById("status").innerHTML =
-          `✅ Sent! <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a><br>⏳ Waiting for confirmation...`;
+          `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View</a><br>⏳ Confirming...`;
 
         await connection.confirmTransaction(sig, "confirmed");
-        debugLog(`✅ TRANSACTION CONFIRMED!`);
-        
+        debugLog(`✅ CONFIRMED!`);
         await updateBalance();
         
-        const successMsg = useFee ? 
-          `🎉 Swap complete with ${(platformFeeBps/100).toFixed(2)}% platform fee! <a href="https://solscan.io/tx/${sig}" target="_blank">View</a>` :
-          `🎉 Swap complete! <a href="https://solscan.io/tx/${sig}" target="_blank">View</a>`;
-        
-        document.getElementById("status").innerHTML = successMsg;
+        document.getElementById("status").innerHTML = `🎉 Complete! <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a>`;
       } catch (err) {
         console.error("Swap error:", err);
-        debugLog(`❌ ERROR: ${err.message}`);
+        debugLog(`❌ ${err.message}`);
         const friendlyError = parseJupiterError(err.message);
         document.getElementById("status").innerHTML = `<span class="error">${friendlyError}</span>`;
       } finally {
@@ -515,7 +551,7 @@
         }
       }, 500);
     } else {
-      document.getElementById("status").innerHTML = '<span class="error">⚠️ No wallet detected</span>';
+      document.getElementById("status").innerHTML = '<span class="error">⚠️ No wallet</span>';
     }
   </script>
 </body>
