@@ -208,10 +208,11 @@
       };
 
       if (useReferral) {
-        swapBody.platformFee = {
-          platformFeeBps: platformFeeBps,
-          platformFeeAccount: REFERRAL_ACCOUNT
-        };
+        swapBody.platformFeeBps=
+      platformFeeBps;
+        swapBody.feeacount:
+      REFERRAL_ACCOUNT;
+
         debugLog("Referral vault added (new format) ✅");
       }
 
