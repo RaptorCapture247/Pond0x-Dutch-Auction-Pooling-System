@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -42,20 +43,17 @@
     .error { color: #ef4444; }
     .success { color: #10b981; }
     .warning { color: #f59e0b; background: #1e293b; padding: 1rem; border-radius: 8px; margin: 1rem auto; max-width: 600px; }
+    .controls-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      max-width: 600px;
+      margin: 1rem auto;
+    }
   </style>
 </head>
 <body>
   <h1>Jupiter Swapper (Affiliate Tracking)</h1>
-  
-  <div class="warning">
-    <p><strong>⚠️ RPC Configuration</strong></p>
-    <p style="font-size: 0.85rem;">Using public RPC (may be rate-limited). For better performance, get a free RPC from:</p>
-    <p style="font-size: 0.8rem;">
-      <a href="https://www.helius.dev/" target="_blank">Helius</a> | 
-      <a href="https://www.quicknode.com/" target="_blank">QuickNode</a> | 
-      <a href="https://www.alchemy.com/solana" target="_blank">Alchemy</a>
-    </p>
-  </div>
 
   <div class="info">
     <p><strong>🔗 Affiliate Referral Vault:</strong></p>
@@ -63,14 +61,25 @@
     <p>Swaps count toward affiliate program participation</p>
   </div>
 
-  <!-- Fee Controls -->
-  <div class="fee-controls">
-    <p><strong>💰 Platform Fee</strong></p>
-    <div class="fee-display">
-      <span id="feePercent">1.00</span>% (<span id="feeBps">100</span> bps)
+  <!-- Fee & Slippage Controls -->
+  <div class="controls-grid">
+    <div class="fee-controls">
+      <p><strong>💰 Platform Fee</strong></p>
+      <div class="fee-display">
+        <span id="feePercent">1.00</span>%
+      </div>
+      <input type="number" id="feeInput" class="fee-input" min="0" max="1000" value="100" step="10" />
+      <p style="font-size: 0.8rem; color: #94a3b8;">bps (100 = 1%)</p>
     </div>
-    <input type="number" id="feeInput" class="fee-input" min="0" max="1000" value="100" step="10" />
-    <p style="font-size: 0.8rem; color: #94a3b8;">Adjust fee in bps (100 bps = 1%)</p>
+
+    <div class="fee-controls">
+      <p><strong>📊 Slippage</strong></p>
+      <div class="fee-display">
+        <span id="slippagePercent">1.00</span>%
+      </div>
+      <input type="number" id="slippageInput" class="fee-input" min="10" max="5000" value="100" step="10" />
+      <p style="font-size: 0.8rem; color: #94a3b8;">bps (100 = 1%)</p>
+    </div>
   </div>
 
   <div class="row">
@@ -133,7 +142,6 @@
     
     function updateFeeDisplay(bps) {
       document.getElementById("feePercent").textContent = (bps / 100).toFixed(2);
-      document.getElementById("feeBps").textContent = bps;
     }
     updateFeeDisplay(platformFeeBps);
     
@@ -141,6 +149,23 @@
       platformFeeBps = parseInt(e.target.value) || 100;
       localStorage.setItem("platformFeeBps", platformFeeBps);
       updateFeeDisplay(platformFeeBps);
+      getEstimate(); // Refresh estimate
+    });
+
+    // Slippage management
+    let slippageBps = parseInt(localStorage.getItem("slippageBps")) || 100;
+    document.getElementById("slippageInput").value = slippageBps;
+    
+    function updateSlippageDisplay(bps) {
+      document.getElementById("slippagePercent").textContent = (bps / 100).toFixed(2);
+    }
+    updateSlippageDisplay(slippageBps);
+    
+    document.getElementById("slippageInput").addEventListener("input", (e) => {
+      slippageBps = parseInt(e.target.value) || 100;
+      localStorage.setItem("slippageBps", slippageBps);
+      updateSlippageDisplay(slippageBps);
+      getEstimate(); // Refresh estimate
     });
 
     // Browser-compatible Buffer polyfill
@@ -174,11 +199,10 @@
         } catch (err) {
           console.error(`RPC call failed (attempt ${i + 1}):`, err);
           if (i < maxRetries && err.message?.includes('403')) {
-            // Try next RPC endpoint
             currentRpcIndex = (currentRpcIndex + 1) % RPC_ENDPOINTS.length;
             connection = new solanaWeb3.Connection(RPC_ENDPOINTS[currentRpcIndex], 'confirmed');
             console.log(`Switching to RPC: ${RPC_ENDPOINTS[currentRpcIndex]}`);
-            await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1s before retry
+            await new Promise(resolve => setTimeout(resolve, 1000));
           } else {
             throw err;
           }
@@ -195,7 +219,6 @@
 
         document.getElementById("status").innerText = "🔄 Requesting wallet connection...";
         
-        // Check if already connected
         if (window.solana.isConnected && window.solana.publicKey) {
           walletPublicKey = window.solana.publicKey.toBase58();
           isWalletConnected = true;
@@ -206,7 +229,6 @@
           return;
         }
 
-        // Request connection
         console.log("Requesting wallet connection...");
         const resp = await window.solana.connect();
         
@@ -303,7 +325,7 @@
       
       try {
         const quote = await fetch(
-          `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=50&platformFeeBps=${platformFeeBps}`
+          `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&platformFeeBps=${platformFeeBps}`
         ).then(r => {
           if (!r.ok) throw new Error(`Quote failed: ${r.statusText}`);
           return r.json();
@@ -316,6 +338,19 @@
         console.error("Estimate error:", err);
         document.getElementById("estimate").innerText = "Estimated output: —";
       }
+    }
+
+    function parseJupiterError(errorMessage) {
+      if (errorMessage.includes('0x1789')) {
+        return '🔴 Slippage tolerance exceeded! The price moved too much.\n\n💡 Try:\n• Increasing slippage to 1-3%\n• Using a smaller amount\n• Waiting a few seconds and trying again';
+      }
+      if (errorMessage.includes('0x1')) {
+        return '❌ Insufficient balance or account not found';
+      }
+      if (errorMessage.includes('0x0')) {
+        return '❌ Insufficient liquidity for this swap';
+      }
+      return errorMessage;
     }
 
     async function swap() {
@@ -335,12 +370,13 @@
 
       const decimals = TOKEN_DECIMALS[inputMint] || 6;
       const amount = Math.floor(uiAmount * 10 ** decimals);
-      document.getElementById("status").innerText = "🔄 Fetching best route...";
+      document.getElementById("status").innerText = "🔄 Fetching fresh quote...";
       document.getElementById("swap").disabled = true;
 
       try {
+        // Get fresh quote right before swap
         const quote = await fetch(
-          `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=50&platformFeeBps=${platformFeeBps}`
+          `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&platformFeeBps=${platformFeeBps}`
         ).then(r => {
           if (!r.ok) throw new Error(`Quote failed: ${r.statusText}`);
           return r.json();
@@ -381,14 +417,15 @@
         
         document.getElementById("status").innerHTML =
           `✅ Swap sent: <a href="https://solscan.io/tx/${sig}" target="_blank">${sig.slice(0, 8)}...</a><br>` +
-          `Fee: ${(platformFeeBps/100).toFixed(2)}%<br>⏳ Waiting for confirmation...`;
+          `Fee: ${(platformFeeBps/100).toFixed(2)}% | Slippage: ${(slippageBps/100).toFixed(2)}%<br>⏳ Waiting for confirmation...`;
 
         await connection.confirmTransaction(sig, "confirmed");
         await updateBalance();
         document.getElementById("status").innerHTML += "<br>🎉 Confirmed! Swap counted toward affiliate vault.";
       } catch (err) {
         console.error("Swap error:", err);
-        document.getElementById("status").innerHTML = `<span class="error">❌ Error: ${err.message}</span>`;
+        const friendlyError = parseJupiterError(err.message);
+        document.getElementById("status").innerHTML = `<span class="error">${friendlyError}</span>`;
       } finally {
         document.getElementById("swap").disabled = false;
       }
