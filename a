@@ -46,7 +46,6 @@
     }
     .error { color: #ef4444; }
     .success { color: #10b981; }
-    .warning { color: #f59e0b; background: #1e293b; padding: 1rem; border-radius: 8px; margin: 1rem auto; max-width: 600px; }
     .controls-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -54,7 +53,7 @@
       max-width: 600px;
       margin: 1rem auto;
     }
-    .debug { background: #1e293b; padding: 1rem; border-radius: 8px; margin: 1rem auto; max-width: 600px; font-size: 0.85rem; text-align: left; font-family: monospace; }
+    .debug { background: #1e293b; padding: 1rem; border-radius: 8px; margin: 1rem auto; max-width: 600px; font-size: 0.85rem; text-align: left; font-family: monospace; max-height: 300px; overflow-y: auto; }
   </style>
 </head>
 <body>
@@ -66,7 +65,7 @@
     <div style="margin-top: 1rem;">
       <label>
         <input type="checkbox" id="useReferral" />
-        Enable Referral Fee Account (try without first)
+        Enable Referral Fee (uncheck if swaps fail)
       </label>
     </div>
   </div>
@@ -208,7 +207,7 @@
         );
         
         const address = referralTokenAccount.toBase58();
-        debugLog(`Referral token account derived: ${address}`);
+        debugLog(`Referral account: ${address}`);
         
         return address;
       } catch (err) {
@@ -247,14 +246,13 @@
         if (window.solana.isConnected && window.solana.publicKey) {
           walletPublicKey = window.solana.publicKey.toBase58();
           isWalletConnected = true;
-          document.getElementById("status").innerHTML = `✅ Already connected: <strong>${walletPublicKey.slice(0, 4)}...${walletPublicKey.slice(-4)}</strong>`;
+          document.getElementById("status").innerHTML = `✅ Connected: <strong>${walletPublicKey.slice(0, 4)}...${walletPublicKey.slice(-4)}</strong>`;
           document.getElementById("connect").innerText = "Disconnect";
           document.getElementById("swap").disabled = false;
           await updateBalance();
           return;
         }
 
-        console.log("Requesting wallet connection...");
         const resp = await window.solana.connect();
         
         if (!resp || !resp.publicKey) {
@@ -264,7 +262,6 @@
         walletPublicKey = resp.publicKey.toBase58();
         isWalletConnected = true;
         
-        console.log("Wallet connected:", walletPublicKey);
         document.getElementById("status").innerHTML = `✅ Connected: <strong>${walletPublicKey.slice(0, 4)}...${walletPublicKey.slice(-4)}</strong>`;
         document.getElementById("connect").innerText = "Disconnect";
         document.getElementById("swap").disabled = false;
@@ -276,9 +273,7 @@
         document.getElementById("swap").disabled = true;
         
         if (err.code === 4001 || err.message?.includes("User rejected")) {
-          document.getElementById("status").innerHTML = `<span class="error">❌ Connection rejected by user</span>`;
-        } else if (err.code === -32603) {
-          document.getElementById("status").innerHTML = `<span class="error">❌ Wallet is locked. Please unlock your wallet and try again.</span>`;
+          document.getElementById("status").innerHTML = `<span class="error">❌ Connection rejected</span>`;
         } else {
           document.getElementById("status").innerHTML = `<span class="error">❌ Connection failed: ${err.message}</span>`;
         }
@@ -331,7 +326,7 @@
         document.getElementById("balance").innerText = `Balance: ${balanceUI.toFixed(6)}`;
       } catch (err) {
         console.error("Balance fetch error:", err);
-        document.getElementById("balance").innerText = `Balance: Error (RPC issue)`;
+        document.getElementById("balance").innerText = `Balance: Error`;
       }
     }
 
@@ -350,12 +345,15 @@
       
       try {
         const useReferral = document.getElementById("useReferral").checked;
-        const feeParam = useReferral ? `&platformFeeBps=${platformFeeBps}` : '';
         
-        // Use Jupiter API v6 (correct endpoint)
-        const quote = await fetch(
-          `https://api.jup.ag/quote/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}${feeParam}`
-        ).then(r => {
+        // Build URL without fee param if not using referral
+        let url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
+        
+        if (useReferral) {
+          url += `&platformFeeBps=${platformFeeBps}`;
+        }
+        
+        const quote = await fetch(url).then(r => {
           if (!r.ok) throw new Error(`Quote failed: ${r.statusText}`);
           return r.json();
         });
@@ -371,7 +369,7 @@
 
     function parseJupiterError(errorMessage) {
       if (errorMessage.includes('0x1789')) {
-        return '🔴 Slippage exceeded or account issue!\n\nTry: Disable referral account or increase slippage';
+        return '🔴 Slippage exceeded!\n\n💡 Try:\n• Unchecking referral\n• Increasing slippage to 3-5%\n• Using smaller amount';
       }
       if (errorMessage.includes('0x1')) {
         return '❌ Insufficient balance';
@@ -398,64 +396,70 @@
       }
 
       // Clear debug log
-      document.getElementById("debug").innerHTML = "<strong>Debug Log:</strong><br>";
+      document.getElementById("debug").innerHTML = "<strong>🔍 Debug Log:</strong><br>";
       document.getElementById("debug").style.display = "block";
 
       const decimals = TOKEN_DECIMALS[inputMint] || 6;
       const amount = Math.floor(uiAmount * 10 ** decimals);
-      document.getElementById("status").innerText = "🔄 Fetching quote...";
+      document.getElementById("status").innerText = "🔄 Getting quote...";
       document.getElementById("swap").disabled = true;
 
       try {
         const useReferral = document.getElementById("useReferral").checked;
-        debugLog(`Referral enabled: ${useReferral}`);
-        debugLog(`Platform fee: ${platformFeeBps} bps`);
-        debugLog(`Slippage: ${slippageBps} bps`);
+        debugLog(`Referral: ${useReferral ? 'ENABLED' : 'DISABLED'}`);
+        debugLog(`Fee: ${platformFeeBps} bps, Slippage: ${slippageBps} bps`);
         
-        const feeParam = useReferral ? `&platformFeeBps=${platformFeeBps}` : '';
+        // Build URL
+        let quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
+        if (useReferral) {
+          quoteUrl += `&platformFeeBps=${platformFeeBps}`;
+        }
         
-        debugLog(`Fetching quote from Jupiter API...`);
-        const quote = await fetch(
-          `https://api.jup.ag/quote/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}${feeParam}`
-        ).then(r => {
+        debugLog(`Fetching quote...`);
+        const quote = await fetch(quoteUrl).then(r => {
           if (!r.ok) throw new Error(`Quote failed: ${r.statusText}`);
           return r.json();
         });
         
-        debugLog(`Quote: ${quote.outAmount}`);
+        debugLog(`✓ Quote OK: ${quote.outAmount}`);
 
         let feeAccount = null;
         if (useReferral) {
           feeAccount = await getReferralTokenAccount(outputMint);
+          if (!feeAccount) {
+            debugLog(`⚠️ No fee account - disabling referral`);
+          }
         }
         
-        document.getElementById("status").innerText = "📝 Preparing transaction...";
+        document.getElementById("status").innerText = "📝 Building transaction...";
 
         const swapBody = {
           userPublicKey: walletPublicKey,
           quoteResponse: quote,
           wrapAndUnwrapSol: true,
           prioritizationFeeLamports: "auto",
+          dynamicComputeUnitLimit: true
         };
 
+        // Only add feeAccount if we have one
         if (feeAccount && useReferral) {
           swapBody.feeAccount = feeAccount;
-          debugLog(`Fee account: ${feeAccount}`);
+          debugLog(`✓ Fee account included`);
         } else {
-          debugLog(`No fee account`);
+          debugLog(`ℹ No fee account`);
         }
 
         debugLog(`Calling swap API...`);
-        const swapRes = await fetch("https://api.jup.ag/swap/v1/swap", {
+        const swapRes = await fetch("https://lite-api.jup.ag/swap/v1/swap", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(swapBody),
         }).then(r => {
-          if (!r.ok) throw new Error(`Swap failed: ${r.statusText}`);
+          if (!r.ok) throw new Error(`Swap API failed: ${r.statusText}`);
           return r.json();
         });
 
-        debugLog(`Requesting signature...`);
+        debugLog(`✓ Transaction ready`);
         document.getElementById("status").innerText = "✍️ Sign in wallet...";
         const tx = swapRes.swapTransaction;
         
@@ -463,22 +467,22 @@
         const versionedTx = solanaWeb3.VersionedTransaction.deserialize(txBytes);
         const signedTx = await window.solana.signTransaction(versionedTx);
         
-        debugLog(`Sending transaction...`);
+        debugLog(`✓ Signed, sending...`);
         document.getElementById("status").innerText = "📡 Sending...";
+        
         const sig = await connection.sendRawTransaction(signedTx.serialize(), {
           skipPreflight: false,
           maxRetries: 2
         });
         
-        debugLog(`Tx: ${sig}`);
+        debugLog(`✓ Sent: ${sig}`);
         document.getElementById("status").innerHTML =
-          `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">${sig.slice(0, 8)}...</a><br>` +
-          `⏳ Confirming...`;
+          `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a><br>⏳ Confirming...`;
 
         await connection.confirmTransaction(sig, "confirmed");
-        debugLog(`✅ Confirmed!`);
+        debugLog(`✅ CONFIRMED!`);
         await updateBalance();
-        document.getElementById("status").innerHTML += "<br>🎉 Swap complete!";
+        document.getElementById("status").innerHTML = `🎉 Swap complete! <a href="https://solscan.io/tx/${sig}" target="_blank">View</a>`;
       } catch (err) {
         console.error("Swap error:", err);
         debugLog(`❌ ${err.message}`);
@@ -524,14 +528,12 @@
         isWalletConnected = false;
         document.getElementById("connect").innerText = "Connect Wallet";
         document.getElementById("swap").disabled = true;
-        document.getElementById("status").innerText = "Wallet disconnected";
         document.getElementById("balance").innerText = "Balance: —";
       });
 
       window.solana.on('accountChanged', (publicKey) => {
         if (publicKey) {
           walletPublicKey = publicKey.toBase58();
-          document.getElementById("status").innerHTML = `✅ Account: <strong>${walletPublicKey.slice(0, 4)}...${walletPublicKey.slice(-4)}</strong>`;
           updateBalance();
         } else {
           disconnectWallet();
