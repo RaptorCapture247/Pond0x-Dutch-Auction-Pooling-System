@@ -13,11 +13,8 @@
     .row { margin-top: 1rem; }
     a { color: #818cf8; }
     .info, .fee-controls, .debug {
-      background: #1e293b;
-      padding: 1rem;
-      border-radius: 8px;
-      margin: 1rem auto;
-      max-width: 600px;
+      background: #1e293b; padding: 1rem; border-radius: 8px;
+      margin: 1rem auto; max-width: 600px;
     }
     .fee-display { font-size: 1.5rem; font-weight: bold; color: #818cf8; margin: 0.5rem 0; }
     input[type="number"].fee-input {
@@ -91,10 +88,8 @@
 
   <script>
     const REFERRAL_ACCOUNT = "5LmFGjbae5iWejFVT8UiRLggh1me22nTetmere8SjwKy";
-    // ✅ Jupiter's official program ID
     const REFERRAL_PROGRAM_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
-    
-    const RPC_ENDPOINTS = ["barf"];
+    const RPC_ENDPOINTS = ["https://api.mainnet-beta.solana.com"];
     let connection = new solanaWeb3.Connection(RPC_ENDPOINTS[0], 'confirmed');
 
     let walletPublicKey = null, isWalletConnected = false;
@@ -105,7 +100,6 @@
       "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,
     };
 
-    // Load saved preferences
     let platformFeeBps = parseInt(localStorage.getItem("platformFeeBps")) || 85;
     let slippageBps = parseInt(localStorage.getItem("slippageBps")) || 100;
 
@@ -206,34 +200,58 @@
 
       const swapBody = {
         userPublicKey: walletPublicKey,
-        quoteResponse: quote,
         wrapAndUnwrapSol: true,
+        quoteResponse: quote,
+        swapMode: "ExactIn",
+        dynamicComputeUnitLimit: true,
         prioritizationFeeLamports: "auto",
-        dynamicComputeUnitLimit: true
       };
 
-      // ✅ Jupiter handles referral vault internally
       if (useReferral) {
-        swapBody.platformFeeAccount = REFERRAL_ACCOUNT;
-        swapBody.platformFeeBps = platformFeeBps;
-        debugLog("Referral vault added to swapBody ✅");
+        swapBody.platformFee = {
+          platformFeeBps: platformFeeBps,
+          platformFeeAccount: REFERRAL_ACCOUNT
+        };
+        debugLog("Referral vault added (new format) ✅");
       }
 
       debugLog("Building and sending transaction...");
-      const swapRes = await fetch("https://lite-api.jup.ag/swap/v1/swap", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(swapBody),
-      }).then(r => r.json());
 
-      const tx = solanaWeb3.VersionedTransaction.deserialize(Uint8Array.from(atob(swapRes.swapTransaction), c => c.charCodeAt(0)));
-      const signedTx = await window.solana.signTransaction(tx);
-      const sig = await connection.sendRawTransaction(signedTx.serialize());
-      document.getElementById("status").innerHTML = `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a>`;
-      await connection.confirmTransaction(sig, "confirmed");
-      await updateBalance();
+      const res = await fetch("https://lite-api.jup.ag/swap/v1/swap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(swapBody),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        debugLog(`❌ Jupiter API Error (${res.status}): ${errText}`);
+        document.getElementById("status").innerHTML = `<span class="error">❌ Jupiter API Error (${res.status})</span>`;
+        return;
+      }
+
+      const swapRes = await res.json();
+      if (!swapRes.swapTransaction) {
+        debugLog("❌ No swapTransaction returned from API");
+        document.getElementById("status").innerHTML = `<span class="error">❌ No swapTransaction returned</span>`;
+        return;
+      }
+
+      try {
+        const tx = solanaWeb3.VersionedTransaction.deserialize(
+          Uint8Array.from(atob(swapRes.swapTransaction), c => c.charCodeAt(0))
+        );
+        const signedTx = await window.solana.signTransaction(tx);
+        const sig = await connection.sendRawTransaction(signedTx.serialize());
+        document.getElementById("status").innerHTML = `✅ <a href="https://solscan.io/tx/${sig}" target="_blank">View TX</a>`;
+        await connection.confirmTransaction(sig, "confirmed");
+        await updateBalance();
+      } catch (err) {
+        debugLog(`❌ Transaction error: ${err.message}`);
+        document.getElementById("status").innerHTML = `<span class="error">❌ ${err.message}</span>`;
+      }
     }
 
-    // Listeners
     document.getElementById("connect").onclick = connectWallet;
     document.getElementById("swap").onclick = swap;
     document.getElementById("inputMint").onchange = updateBalance;
